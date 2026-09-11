@@ -1,0 +1,12 @@
+api
+api2
+dataset
+pt-models
+worm-datas
+worm-raw-imgs
+.ipynb_checkpoints/
+__pycache__/
+onnx/
+ckpt/
+tb/
+logs/
