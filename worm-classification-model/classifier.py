@@ -294,6 +294,7 @@ class WormClassificationModel:
         test_acc_2c = test_prec_2c = test_rec_2c = test_f1_2c = None
 
         collapse_needed = len(self.class_names) > 2 and self.good_idx is not None
+        is_native_binary = len(self.class_names) == 2
 
         # Only evaluate if test_loader exists
         if test_loader is not None:
@@ -302,7 +303,7 @@ class WormClassificationModel:
 
             if collapse_needed:
                 collapse_map = build_label_collapse_map(self.class_names, self.good_idx).to(device)
-                collapsed_class_names = ['good', 'other']
+                collapsed_class_names = [self.class_names[self.good_idx], 'other']
                 collapsed_metrics = build_metrics(2, device)
 
             with torch.no_grad():
@@ -330,6 +331,8 @@ class WormClassificationModel:
                 test_prec_2c = collapsed_result['precision'].item()
                 test_rec_2c = collapsed_result['recall'].item()
                 test_f1_2c = collapsed_result['f1'].item()
+            elif is_native_binary:
+                test_acc_2c, test_prec_2c, test_rec_2c, test_f1_2c = test_acc, test_prec, test_rec, test_f1
 
         if is_main:
             # Only log test confusion matrices if test set exists
@@ -375,7 +378,7 @@ class WormClassificationModel:
 
         result = {'best_f1': best_f1, 'best_epoch': best_epoch, 'test_f1': test_f1,
                   'test_accuracy': test_acc, 'ckpt_path': str(ckpt_path)}
-        if collapse_needed:
+        if collapse_needed or is_native_binary:
             result['test_f1_2class'] = test_f1_2c
             result['test_accuracy_2class'] = test_acc_2c
             
@@ -403,6 +406,7 @@ class WormClassificationModel:
         val_metrics = build_metrics(num_classes, device)
 
         collapse_needed = len(self.class_names) > 2 and self.good_idx is not None
+        is_native_binary = len(self.class_names) == 2
         if collapse_needed:
             collapse_map = build_label_collapse_map(self.class_names, self.good_idx).to(device)
             val_collapsed_metrics = build_metrics(2, device)
@@ -512,6 +516,13 @@ class WormClassificationModel:
                         'val_precision_2class': val_collapsed_result['precision'].item(),
                         'val_recall_2class': val_collapsed_result['recall'].item(),
                         'val_f1_2class': val_collapsed_result['f1'].item(),
+                    })
+                elif is_native_binary:
+                    best_snapshot.update({
+                        'val_accuracy_2class': val_result['accuracy'].item(),
+                        'val_precision_2class': val_result['precision'].item(),
+                        'val_recall_2class': val_result['recall'].item(),
+                        'val_f1_2class': current_f1,
                     })
             else:
                 patience_counter += 1

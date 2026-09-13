@@ -1,6 +1,13 @@
 """
-รวม summary.csv ของทุก dataset/family ใน experiment เดียว เป็น Excel workbook
-เดียว โดยแยกเป็น 1 sheet ต่อ 1 dataset (เหมือนที่ทำมือใน Google Sheets)
+รวม summary.csv ของทุก dataset/family ใน experiment เดียว เป็น Excel workbook เดียว
+
+โครงสร้าง workbook ที่ได้:
+  - 1 sheet ต่อ 1 family (convnext, resnet, vit, swin, swin_v2, efficientnet_v2, yolo26)
+    รวมทุก dataset ไว้ในตารางเดียว มีคอลัมน์ 'dataset' บอกที่มา
+    -> ใช้เทียบ performance ของ family เดียวกันข้าม dataset ได้ในตารางเดียว
+  - 1 sheet ต่อ 1 dataset (2class, 5class, ...)
+    รวมทุก family ไว้ในตารางเดียว มีคอลัมน์ 'family' บอกที่มา
+    -> ใช้เทียบ family ต่างๆ บน dataset เดียวกัน
 
 ใช้:
     python aggregate_results.py --experiment model_benchmark
@@ -14,25 +21,35 @@ import pandas as pd
 import config as c
 
 
-def collect_summaries(experiment_dir: Path):
-    """คืน dict: dataset_name -> DataFrame ที่รวม summary.csv ของทุก family แล้ว"""
+def collect_all_runs(experiment_dir: Path) -> pd.DataFrame:
+    """อ่าน summary.csv ทุกไฟล์ใต้ log/<dataset>/<family>/summary.csv
+    คืน DataFrame เดียวรวมทุกอย่าง พร้อมคอลัมน์ 'dataset' และ 'family'"""
     log_root = experiment_dir / 'log'
-    per_dataset = {}
+    frames = []
 
     for dataset_dir in sorted(log_root.iterdir()):
         if not dataset_dir.is_dir():
             continue
-        frames = []
         for family_dir in sorted(dataset_dir.iterdir()):
             summary_path = family_dir / 'summary.csv'
             if summary_path.exists():
                 df = pd.read_csv(summary_path)
+                df.insert(0, 'dataset', dataset_dir.name)
                 df.insert(0, 'family', family_dir.name)
                 frames.append(df)
-        if frames:
-            per_dataset[dataset_dir.name] = pd.concat(frames, ignore_index=True)
 
-    return per_dataset
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def split_by(df: pd.DataFrame, key: str, sort_by: list[str]) -> dict[str, pd.DataFrame]:
+    """แยก DataFrame รวมออกเป็น dict ตามคอลัมน์ key เช่น 'family' หรือ 'dataset'"""
+    result = {}
+    for value in sorted(df[key].unique()):
+        sub = df[df[key] == value].sort_values(sort_by).reset_index(drop=True)
+        result[value] = sub
+    return result
 
 
 def main():
@@ -45,19 +62,28 @@ def main():
     experiment_dir = Path(c.OUTPUT_DIR) / args.experiment
     out_path = Path(args.output) if args.output else experiment_dir / 'all_results.xlsx'
 
-    per_dataset = collect_summaries(experiment_dir)
-    if not per_dataset:
+    all_runs = collect_all_runs(experiment_dir)
+    if all_runs.empty:
         print(f"❌ ไม่เจอ summary.csv เลยใต้ {experiment_dir / 'log'}")
         return
 
+    per_family = split_by(all_runs, key='family', sort_by=['dataset', 'variant'])
+    per_dataset = split_by(all_runs, key='dataset', sort_by=['family', 'variant'])
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
-        for dataset_name, df in per_dataset.items():
-            sheet_name = dataset_name[:31]  # Excel จำกัดชื่อ sheet 31 ตัวอักษร
+        # sheet ต่อ family ก่อน (เทียบข้าม dataset)
+        for family_name, df in per_family.items():
+            sheet_name = family_name[:31]
             df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    total_rows = sum(len(df) for df in per_dataset.values())
-    print(f"✅ เขียน {total_rows} แถว ครอบคลุม {len(per_dataset)} dataset sheet ไปที่ {out_path}")
+        # ตามด้วย sheet ต่อ dataset (เทียบข้าม family) เหมือนเดิม
+        for dataset_name, df in per_dataset.items():
+            sheet_name = dataset_name[:31]
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    print(f"✅ เขียน {len(all_runs)} แถว รวม -> {len(per_family)} family sheet, "
+          f"{len(per_dataset)} dataset sheet ไปที่ {out_path}")
 
 
 if __name__ == '__main__':

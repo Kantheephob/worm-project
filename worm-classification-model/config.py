@@ -68,7 +68,7 @@ DATASETS = {
 }
 
 # 2 class calculate
-GOOD_CLASS_NAMES = ['good']
+GOOD_CLASS_NAMES = ['good', 'Perfect']
 
 # seed
 SEED = 42
