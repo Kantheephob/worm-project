@@ -385,7 +385,7 @@ def save_to_csv():
     else:
         final_df = new_df
 
-    final_df.sort_values(by='Filename', inplace=True)
+    # final_df.sort_values(by='Filename', inplace=True)
 
     try:
         backup_path = backup_csv_file(csv_save_path)
