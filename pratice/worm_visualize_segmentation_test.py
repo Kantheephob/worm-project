@@ -26,7 +26,7 @@ color_map = {
     6: 'Purple',  
 }
 
-def get_dataset(labels_path, roi_metadata_path, masks_dir):
+def get_full_dataframe(labels_path, roi_metadata_path, masks_dir):
     """
     Merge label CSV with ROI metadata and attach per-instance mask info
     (V, L, A, BY, bUse, roi_bbox_xyxy, max_ratio, boundary, img_h, img_w)
@@ -204,7 +204,7 @@ def plot_segmentation_blocks(label_path, roi_metadata_path, pkl_dir, start=1, st
     """
     
     # เตรียม dataframe
-    df = get_dataset(label_path, roi_metadata_path, pkl_dir)
+    df = get_full_dataframe(label_path, roi_metadata_path, pkl_dir)
     
     # ดึงรูปทั้งหมด
     image_list_all = df['raw_img_path'].drop_duplicates().sort_values().tolist()
