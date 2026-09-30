@@ -46,25 +46,19 @@ OUTPUT_DIR = '/scratch/lt200264-saiwat/worm-project/worm-classification-model'
 EXPERIMENT_NAME = 'model_benchmark'
 
 # dataset path
-CLS2 = '/project/lt200264-saiwat/WormProject/data/classify-v1/cls_2classes'
-CLS5 = '/project/lt200264-saiwat/WormProject/data/classify-v1/cls_5classes'
-CLS2_PAD0_BLACKOUT = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v1/views/cls2_pad0_blackout'
-CLS2_PAD30_DIM0P3 = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v1/views/cls2_pad30_dim0p3'
-CLS2_PAD30_RAW = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v1/views/cls2_pad30_raw'
-CLS3_STAGE_PAD30 = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v1/views/cls3_stage_pad30'
-CLS4_PAD30 = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v1/views/cls4_pad30'
-CLS5_PAD30 = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v1/views/cls5_pad30'
+CLS2_BLACKOUT = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v3/views/cls2_blackout/'
+CLS2_DIM = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v3/views/cls2_dim/'
+CLS2_RAW = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v3/views/cls2_raw/'
+CLS4_RAW = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v3/views/cls4_raw/'
+CLS5_RAW = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v3/views/cls5_raw/'
 
 # name map
 DATASETS = {
-    '2class': CLS2,
-    '5class': CLS5,
-    '2class_pad0_blackout': CLS2_PAD0_BLACKOUT,
-    '2class_pad30_dim': CLS2_PAD30_DIM0P3,
-    '2class_pad30_raw': CLS2_PAD30_RAW,
-    '3class_stage_pad30': CLS3_STAGE_PAD30,
-    '4class_pad30': CLS4_PAD30,
-    '5class_pad30': CLS5_PAD30,
+    '2class_blackout': CLS2_BLACKOUT,
+    '2class_dim': CLS2_DIM,
+    '2class_raw': CLS2_RAW,
+    '4class_raw': CLS4_RAW,
+    '5class_raw': CLS5_RAW,
 }
 
 # 2 class calculate
