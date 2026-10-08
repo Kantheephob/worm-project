@@ -1,31 +1,190 @@
+from time import perf_counter
 import torch
-from torchmetrics import MetricCollection
-from torchmetrics.classification import (
-    MulticlassAccuracy, MulticlassPrecision, MulticlassRecall, MulticlassF1Score, MulticlassConfusionMatrix,
-)
-
-import config as c
+import torch.distributed as dist
+from torch.amp import autocast
 
 
-def build_metrics(num_classes, device=c.DEVICE):
-    metrics = MetricCollection({
-        'accuracy': MulticlassAccuracy(num_classes=num_classes, average='macro'),
-        'precision': MulticlassPrecision(num_classes=num_classes, average='macro'),
-        'recall': MulticlassRecall(num_classes=num_classes, average='macro'),
-        'f1': MulticlassF1Score(num_classes=num_classes, average='macro'),
-        'confusion_matrix': MulticlassConfusionMatrix(num_classes=num_classes),
-    })
-    return metrics.to(device)
-
-
-def find_good_class_index(class_names, candidates=('good',)):
-    normalized = {name.strip().lower(): i for i, name in enumerate(class_names)}
-    for cand in candidates:
-        idx = normalized.get(cand.strip().lower())
+def find_class_index(cls_names, candidates):
+    """หา index ของ positive class"""
+    # create class index map
+    normalized = {name.strip().lower(): i for i, name in enumerate(cls_names)}  # class name มาจาก ImageFolder.classes
+    # find positive index 
+    for cand in candidates: # alter positive class name
+        idx = normalized.get(cand.stinp().lower())
         if idx is not None:
             return idx
     return None
 
 
-def build_label_collapse_map(class_names, good_idx):
-    return torch.tensor([0 if i == good_idx else 1 for i in range(len(class_names))])
+def _is_dist():
+    return dist.is_available() and dist.is_initialized()
+
+
+def gather_eval_tensor(t, dataset_len):
+    """รวมผลทำนายที่กระจายอยู่ตาม gpu แต่ละใบกลับเข้ามาให้ครบตามจำนวณเริ่มต้น
+    DistributedSampler บังคับว่าทุก gpu จะต้องได้ภาพเท่ากัน ถ้าหารไม่ลงตัวจะใช้วิธีการวนภาพซ้ำ"""
+    if not _is_dist():  # 1 gpu just return
+        return t[:dataset_len]
+ 
+    world = dist.get_world_size()   # จำนวน gpu
+    local_n = torch.tensor([t.shape[0]], device=t.device, dtype=torch.long) # จำนวนผลลัพธ์ของ gpu ตัวเอง
+    sizes = [torch.zeros_like(local_n) for _ in range(world)]
+    dist.all_gather(sizes, local_n)
+    sizes = [int(s.item()) for s in sizes]
+    max_n = max(sizes)
+ 
+    if t.shape[0] < max_n:
+        pad = torch.zeros((max_n - t.shape[0], *t.shape[1:]), dtype=t.dtype, device=t.device)
+        t = torch.cat([t, pad])
+    buf = [torch.empty_like(t) for _ in range(world)]
+    dist.all_gather(buf, t.contiguous())
+ 
+    if len(set(sizes)) == 1 and sizes[0] * world >= dataset_len:
+        n = sizes[0]
+        full = torch.cat(buf)  # rank-major: [rank0 samples..., rank1 samples..., ...]
+        keep = torch.ones(n * world, dtype=torch.bool, device=t.device)
+        # global position g was given to rank (g % world) at local position (g // world)
+        for g in range(dataset_len, n * world):
+            keep[(g % world) * n + g // world] = False
+        return full[keep]
+ 
+    return torch.cat([b[:s] for b, s in zip(buf, sizes)])[:dataset_len]
+
+
+def confusion_matrix(preds, labels, num_classes):
+    """Rows = true class, columns = predicted class."""
+    idx = labels.long() * num_classes + preds.long()
+    return torch.bincount(idx, minlength=num_classes ** 2).reshape(num_classes, num_classes)
+ 
+ 
+def _safe_div(a, b):
+    return torch.where(b > 0, a / b.clamp_min(1e-12), torch.zeros_like(a))
+ 
+ 
+def metrics_from_cm(cm):
+    """acc = overall accuracy; prec/recall/f1 = macro average over classes."""
+    cm = cm.double()
+    tp = cm.diag()
+    prec = _safe_div(tp, cm.sum(0))
+    rec = _safe_div(tp, cm.sum(1))
+    f1 = _safe_div(2 * prec * rec, prec + rec)
+    return {
+        'acc': (tp.sum() / cm.sum().clamp_min(1)).item(),
+        'prec': prec.mean().item(),
+        'recall': rec.mean().item(),
+        'f1': f1.mean().item(),
+    }
+ 
+ 
+def binary_metrics(pred_pos, true_pos):
+    """Positive class = Perfect. Returns metrics for the positive class + 2x2 CM [[TP, FN], [FP, TN]]."""
+    tp = int((pred_pos & true_pos).sum())
+    fp = int((pred_pos & ~true_pos).sum())
+    fn = int((~pred_pos & true_pos).sum())
+    tn = int((~pred_pos & ~true_pos).sum())
+    total = tp + fp + fn + tn
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
+    acc = (tp + tn) / total if total else 0.0
+    cm = torch.tensor([[tp, fn], [fp, tn]], dtype=torch.long)
+    return {'acc': acc, 'prec': prec, 'recall': rec, 'f1': f1, 'cm': cm}
+ 
+ 
+def make_threshold_grid(spec=(0.01, 0.99, 0.01), device='cpu'):
+    start, stop, step = spec
+    return torch.arange(start, stop + step / 2, step, device=device, dtype=torch.float32)
+ 
+ 
+def find_best_threshold(p_pos, true_pos, grid):
+    """Threshold t that maximizes F1 of the positive class, where pred = (P(positive) >= t)."""
+    grid = grid.to(p_pos.device)
+    preds = p_pos.unsqueeze(0) >= grid.unsqueeze(1)  # (T, N)
+    y = true_pos.unsqueeze(0)
+    tp = (preds & y).sum(1).double()
+    fp = (preds & ~y).sum(1).double()
+    fn = (~preds & y).sum(1).double()
+    denom = 2 * tp + fp + fn
+    f1 = torch.where(denom > 0, 2 * tp / denom.clamp_min(1), torch.zeros_like(denom))
+    best = int(torch.argmax(f1))
+    return float(grid[best]), float(f1[best])
+ 
+ 
+def compute_metrics(probs, labels, num_classes, pos_idx=None, threshold=None, grid=None):
+    """All metrics from softmax probabilities.
+ 
+    Keys:
+      loss, acc, prec, recall, f1, cm                    -> all classes (argmax, macro)
+      acc_2class, prec_2class, recall_2class, f1_2class, cm_2class
+                                                          -> Perfect vs rest, argmax
+      threshold, acc_perfect_at_thr, prec_perfect_at_thr, recall_perfect_at_thr, f1_perfect_at_thr, cm_thr
+                                                          -> Perfect vs rest, P(Perfect) >= threshold
+    threshold=None -> search the best one (use on val). Pass the val threshold for test.
+    """
+    out = {}
+    labels = labels.long()
+    p_true = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
+    out['loss'] = (-torch.log(p_true.clamp_min(1e-12))).mean().item()  # = CrossEntropy
+ 
+    preds = probs.argmax(1)
+    cm = confusion_matrix(preds, labels, num_classes)
+    out.update(metrics_from_cm(cm))
+    out['cm'] = cm.cpu()
+ 
+    if pos_idx is not None:
+        true_pos = labels == pos_idx
+        p_pos = probs[:, pos_idx]
+ 
+        b = binary_metrics(preds == pos_idx, true_pos)
+        out.update({f'{k}_2class': v for k, v in b.items() if k != 'cm'})
+        out['cm_2class'] = b['cm']
+ 
+        if threshold is None:
+            if grid is None:
+                grid = make_threshold_grid(device=probs.device)
+            threshold, _ = find_best_threshold(p_pos, true_pos, grid)
+        t = binary_metrics(p_pos >= threshold, true_pos)
+        out.update({f'{k}_perfect_at_thr': v for k, v in t.items() if k != 'cm'})
+        out['cm_thr'] = t['cm']
+        out['threshold'] = float(threshold)
+ 
+    return out
+
+
+@torch.no_grad()
+def benchmark_inference(model, img_size, device, amp_enabled=False, amp_dtype=torch.float16,
+                        batch_size=64, warmup=20, iters=100):
+    """Model forward time only (no data loading / preprocessing), synthetic input.
+ 
+    inference_latency_ms : time per image at batch size 1
+    inference_fps        : images per second at batch_size
+    """
+    model.eval()
+    is_cuda = device.type == 'cuda'
+ 
+    def sync():
+        if is_cuda:
+            torch.cuda.synchronize(device)
+ 
+    def run(x, n):
+        for _ in range(n):
+            with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                model(x)
+ 
+    def timed(x, n):
+        sync()
+        t0 = perf_counter()
+        run(x, n)
+        sync()
+        return perf_counter() - t0
+ 
+    x1 = torch.randn(1, 3, img_size, img_size, device=device)
+    run(x1, warmup)
+    latency_ms = timed(x1, iters) / iters * 1000
+ 
+    xb = torch.randn(batch_size, 3, img_size, img_size, device=device)
+    n_b = max(10, iters // 4)
+    run(xb, max(3, warmup // 4))
+    fps = batch_size * n_b / timed(xb, n_b)
+ 
+    return {'inference_latency_ms': latency_ms, 'inference_fps': fps, 'inference_batch_size': batch_size}

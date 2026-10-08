@@ -43,7 +43,7 @@ YOLO26X_CLS_PATH = '/project/lt200264-saiwat/pretrained_models/Yolo/yolo26/yolo2
 OUTPUT_DIR = '/scratch/lt200264-saiwat/worm-project/worm-classification-model'
 
 # experiment name
-EXPERIMENT_NAME = 'model_benchmark'
+EXPERIMENT_NAME = 'model_benchmark_v2'
 
 # dataset path
 CLS2_BLACKOUT = '/project/lt200264-saiwat/WormProject/data/release/worm-24022026-v3/views/cls2_blackout/'
@@ -62,31 +62,40 @@ DATASETS = {
 }
 
 # 2 class calculate
-GOOD_CLASS_NAMES = ['good', 'Perfect']
+GOOD_CLASS_NAMES = ['Perfect']
 
-# seed
+# hardware & reproducibility
 SEED = 42
-
-# device
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# GPU
 NUM_GPUS = 4
 
-# dataloader
+# preprocessing & dataloader
 IMG_SIZE = 224
+UPSCALE = False
+AUGMENT = True
 BATCH_SIZE = 64
 NUM_WORKERS = 8
 PIN_MEMORY = True
 
 # train
 EPOCHS = 100
-LR = 1e-3
+LR = 1e-4
 WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 5
 START_FACTOR = 0.1
 END_FACTOR = 1.0
 ETA_MIN = 1e-5
 USE_AMP = True
+AMP_DTYPE = 'bf16'
 GRAD_CLIP_NORM = 1.0
 EARLY_STOP_PATIENCE = 10
+FSDP_CPU_OFFLOAD =  True
+
+# opimal threshold search
+SELECTION_METRICS = 'val_f1_perfect'
+THRESHOLD_GRID = (0.01, 0.99, 0.01) # start, stop, step
+
+# inference benchmark
+INFER_BATCH_SIZE = BATCH_SIZE
+INFER_WARMUP = 20   # เอาไว้อุ่นเครื่อง hardware / library
+INFER_ITERS = 100   # run จริง วัดจริง

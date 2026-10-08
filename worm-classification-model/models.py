@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from ultralytics import YOLO
+
 import config as c
 
 MODEL_REGISTRY = {
@@ -61,14 +62,18 @@ def resolve_model_names(model_name):
     return matches
 
 
+def count_params(model):
+    return sum(p.numel() for p in model.parameters())
+
+
 def _load_yolo_cls_backbone(ckpt_path):
     wrapper = YOLO(ckpt_path)   # load architecture + weights
-    model = wrapper.model       # ทำให้ใช้แบบ nn.Module ได้
-    
+    model = wrapper.model       # plain nn.Module
+
     model.train()
     for p in model.parameters():
         p.requires_grad = True
-        
+
     return model
 
 
@@ -136,16 +141,38 @@ def _interpolate_vit_pos_embedding(state_dict, model):
     return state_dict
 
 
+def _looks_like_probs(t):
+    if not torch.is_tensor(t) or t.ndim != 2 or t.shape[1] < 2:
+        return False
+    t = t.detach().float()
+    return bool((t >= 0).all()) and bool(torch.allclose(t.sum(1), torch.ones_like(t[:, 0]), atol=1e-2))
+
+
 class _TupleOutputUnwrapper(nn.Module):
+    """Always return LOGITS from an Ultralytics classifier.
+
+    Ultralytics Classify head:
+      train mode -> logits
+      eval mode  -> (softmax_probs, logits)  [new versions]  or  softmax_probs  [old versions]
+    Using the softmax output as logits would apply softmax twice (wrong loss / probabilities).
+    """
+
     def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, x):
         out = self.model(x)
-        return out[0] if isinstance(out, tuple) else out
-    
-    
+        if isinstance(out, (tuple, list)):
+            for o in out:
+                if torch.is_tensor(o) and not _looks_like_probs(o):
+                    return o
+            out = out[0]
+        if not self.training and _looks_like_probs(out):
+            return torch.log(out.float().clamp_min(1e-12))  # log-probs are valid logits
+        return out
+
+
 def build_model(model_name, num_classes, finetune_path=None, device=c.DEVICE):
     model_name = model_name.lower()
     model_function, checkpoint_path = MODEL_REGISTRY[model_name]
