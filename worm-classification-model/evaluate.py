@@ -20,49 +20,70 @@ def _is_dist():
     return dist.is_available() and dist.is_initialized()
 
 
-def gather_eval_tensor(t, dataset_len):
-    """รวมผลทำนายที่กระจายอยู่ตาม gpu แต่ละใบกลับเข้ามาให้ครบตามจำนวณเริ่มต้น
-    DistributedSampler บังคับว่าทุก gpu จะต้องได้ภาพเท่ากัน ถ้าหารไม่ลงตัวจะใช้วิธีการวนภาพซ้ำ"""
-    if not _is_dist():  # 1 gpu just return
-        return t[:dataset_len]
+def gather_eval_tensor(t, dataset_len): # t = tensor model output จาก gpu แต่ละใบ, dataset_len = จำนวนภาพทั้งหมดใน dataset
+    """รวม model ouput จากทุก gpu กลับมาจัดการความซ้ำซ้อนที่อาจเกิดขึ้นได้ตอนทำ sampler หรือ loader ที่มีการวนภาพซ้ำเพื่อให้ทุก gpu มีจำนวนภาพเท่ากัน"""
+    # สมมติ gpu 1 ใบมี 3 ภาพ มี 2 class
+    # output tensor -> t.shape = (3, 2): (H, W) = (จำนวนภาพ, จำนวน class)
+    # t = [
+    # [0.1, 0.9],
+    # [0.8, 0.2],
+    # [0.4, 0.6]
+    # ]
+    
+    # check ว่าทำ distributed หรือไม่
+    if not _is_dist():
+        return t[:dataset_len]  # ส่ง tensor ขนาดเท่าจำนวน dataset กลับไป
  
-    world = dist.get_world_size()   # จำนวน gpu
-    local_n = torch.tensor([t.shape[0]], device=t.device, dtype=torch.long) # จำนวนผลลัพธ์ของ gpu ตัวเอง
-    sizes = [torch.zeros_like(local_n) for _ in range(world)]
-    dist.all_gather(sizes, local_n)
-    sizes = [int(s.item()) for s in sizes]
-    max_n = max(sizes)
+    world = dist.get_world_size()   # จำนวน gpu / จำนวน process
+    # หาว่า gpu ของตัวเองมีภาพเท่าไหร่
+    local_n = torch.tensor(
+        [t.shape[0]],       # จำนวนภาพที่ gpu ใบนี้ทำนายได้เก็บใน list เช่น มี 3 ภาพ -> [tensor([3])]
+        device=t.device,    
+        dtype=torch.long)   # เก็บเป็น tensor เพราะ pytorch คุยกันผ่าน tensor
+    # สร้างกล่องเปล่าไว้เตรียมรับตัวเลขจาก gpu ทุกใบ
+    sizes = [
+        torch.zeros_like(local_n)   # สร้าง tensor เก็บค่า 0 shape เดียวกับ local_n
+        for _ in range(world)]      # loop จำนวน gpu / process ได้เป็น list ของ tensor([0]) ขนาดเท่ากับจำนวนภาพทั้งหมดที่ทุก gpu ได้รับ  เช่น 2 gpu -> [tensor([0]), tensor([0])]
+    dist.all_gather(sizes, local_n) # ดึงค่า local_n จาก gpu ทุกใบมาเก็บใน sizes เช่น gpu 0 มี 3 ภาพ, gpu 1 มี 4 ภาพ, gpu 2 มี 5 ภาพ -> sizes = [tensor([3]), tensor([4]), tensor([5])]
+    sizes = [int(s.item()) for s in sizes]  # แปลง tensor เป็น int 
+    max_n = max(sizes) 
  
+    # ถ้า loader ได้ทำ drop last gpu จะมีจำนวนภาพไม่เท่ากัน เลยต้อง pad ให้มีจำนวนเท่ากันทั้งหมด
     if t.shape[0] < max_n:
-        pad = torch.zeros((max_n - t.shape[0], *t.shape[1:]), dtype=t.dtype, device=t.device)
+        pad = torch.zeros(          # สมมติ max_n = 4 output shape = (3, 2)
+            (max_n - t.shape[0],    # 4 - 3 = 1
+            *t.shape[1:]),          # t.shape[1:] = (2,) เพราะเริ่มที่ W ใน (H, W): * คือ เอาค่าจาก tuple มาใส่ใน tuple ใหม่ -> (1, 2)
+            dtype=t.dtype,
+            device=t.device)
         t = torch.cat([t, pad])
-    buf = [torch.empty_like(t) for _ in range(world)]
-    dist.all_gather(buf, t.contiguous())
+    buf = [torch.empty_like(t) for _ in range(world)]   # สร้างกล่องเปล่าไว้เตรียมรับ output tensor จาก gpu ทุกใบ
+    dist.all_gather(buf, t.contiguous())                # ได้ผลรวม tensor จาก gpu ทุกใบมาเก็บใน buf (N, H, W)
  
+    # ถ้าทุก gpu มีภาพเท่ากันแล้ว และ มีจำนวนภาพรวมเยอะกว่าใน dataset
     if len(set(sizes)) == 1 and sizes[0] * world >= dataset_len:
         n = sizes[0]
-        full = torch.cat(buf)  # rank-major: [rank0 samples..., rank1 samples..., ...]
-        keep = torch.ones(n * world, dtype=torch.bool, device=t.device)
-        # global position g was given to rank (g % world) at local position (g // world)
+        full = torch.cat(buf)   # รวมเป็น tensor เดียว [[, ], [, ], ...]
+        keep = torch.ones(n * world, dtype=torch.bool, device=t.device) # สร้าง tensor เก็บค่า True ขนาดเท่ากับจำนวนภาพรวมของทุก gpu
         for g in range(dataset_len, n * world):
-            keep[(g % world) * n + g // world] = False
+            keep[(g % world) * n + g // world] = False  # ตำแหน่งตัวซ้ำ
         return full[keep]
  
     return torch.cat([b[:s] for b, s in zip(buf, sizes)])[:dataset_len]
 
 
 def confusion_matrix(preds, labels, num_classes):
-    """Rows = true class, columns = predicted class."""
+    """นับจำนวนที่ทำนายถูก/ผิด แยกตามคลาส"""
     idx = labels.long() * num_classes + preds.long()
     return torch.bincount(idx, minlength=num_classes ** 2).reshape(num_classes, num_classes)
  
  
 def _safe_div(a, b):
+    """หารอย่างปลอดภัย ป้องกันหารด้วยศูนย์"""
     return torch.where(b > 0, a / b.clamp_min(1e-12), torch.zeros_like(a))
  
  
 def metrics_from_cm(cm):
-    """acc = overall accuracy; prec/recall/f1 = macro average over classes."""
+    """คำนวณ Accuracy, Precision, Recall, F1 แบบ Macro"""
     cm = cm.double()
     tp = cm.diag()
     prec = _safe_div(tp, cm.sum(0))
@@ -77,7 +98,7 @@ def metrics_from_cm(cm):
  
  
 def binary_metrics(pred_pos, true_pos):
-    """Positive class = Perfect. Returns metrics for the positive class + 2x2 CM [[TP, FN], [FP, TN]]."""
+    """วัดผลแบบ 2 คลาส โดยถือ Perfect เป็น Positive"""
     tp = int((pred_pos & true_pos).sum())
     fp = int((pred_pos & ~true_pos).sum())
     fn = int((~pred_pos & true_pos).sum())
@@ -92,12 +113,13 @@ def binary_metrics(pred_pos, true_pos):
  
  
 def make_threshold_grid(spec=(0.01, 0.99, 0.01), device='cpu'):
+    """สร้างค่า Threshold ตั้งแต่ 0.01 ถึง 0.99 เพิ่มทีละ 0.01"""
     start, stop, step = spec
     return torch.arange(start, stop + step / 2, step, device=device, dtype=torch.float32)
  
  
 def find_best_threshold(p_pos, true_pos, grid):
-    """Threshold t that maximizes F1 of the positive class, where pred = (P(positive) >= t)."""
+    """ทดลองทุก Threshold แล้วเลือกค่าที่ให้ F1 ของ Perfect สูงสุด"""
     grid = grid.to(p_pos.device)
     preds = p_pos.unsqueeze(0) >= grid.unsqueeze(1)  # (T, N)
     y = true_pos.unsqueeze(0)

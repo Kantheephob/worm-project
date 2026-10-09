@@ -8,6 +8,8 @@ from common import set_worker_seed
 
 
 def worm_transforms(img, img_size, upscale=False, augment=False):
+    """resize image aspect ratio for longest side > img_size, pad to square, normalize to ImageNet mean/std, and augment
+    for small image, do not resize but pad to square"""
     img = F.to_image(img) # uint8 tensor 0-255
     _, h, w = img.shape
     longest = max(h, w)
@@ -41,9 +43,11 @@ def worm_transforms(img, img_size, upscale=False, augment=False):
 
 
 def get_dataloaders(dataset_dir, train_transform, eval_transform, batch_size, num_workers, pin_memory, is_distributed=False, is_main=True, seed=42):
+    """do sampler if distributed and build dataloader"""
     ds_dir = Path(dataset_dir)
     train_dir, val_dir, test_dir = ds_dir / 'train', ds_dir / 'val', ds_dir / 'test'
 
+    # 1. load dataset
     train_ds = ImageFolder(root=train_dir, transform=train_transform)
     val_ds = ImageFolder(root=val_dir, transform=eval_transform)
     test_ds = ImageFolder(root=test_dir, transform=eval_transform) if test_dir.exists() else None
@@ -63,7 +67,8 @@ def get_dataloaders(dataset_dir, train_transform, eval_transform, batch_size, nu
         print(f'Test loaded {len(test_ds)} images' if test_ds is not None else 'Test loaded 0 images (no test folder)')
         print(f'Found {num_class} classes: {cls_names}')
 
-    # กระจาย data ให้ gpu แต่ละใบจะได้ข้อมูลไม่ซ้ำกัน
+    # 2. กระจาย dataset ให้ gpu แต่ละใบ
+    # by default DistributedSampler จะกระจาย dataset ให้ gpu แต่ละใบมีจำนวนภาพเท่ากัน ถ้าหารไม่ลงตัวจะใช้วิธีการวนภาพซ้ำ
     train_sampler = DistributedSampler(train_ds, shuffle=True, seed=seed) if is_distributed else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if is_distributed else None
     test_sampler = DistributedSampler(test_ds, shuffle=False) if is_distributed and test_ds is not None else None
@@ -73,8 +78,8 @@ def get_dataloaders(dataset_dir, train_transform, eval_transform, batch_size, nu
     
     common_kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory, worker_init_fn=set_worker_seed, persistent_workers=persistent, prefetch_factor=prefetch)
 
-    # กระจายแล้วเอาเข้า loader
-    train_loader = DataLoader(train_ds, shuffle=(train_sampler is None), sampler=train_sampler, drop_last=True, **common_kw) # ห้ามสุ่มซ้ำถ้าทำ ddp เพราะสุ่มใน sampler ไปแล้ว
+    # 3. ทำเป็น dataloader
+    train_loader = DataLoader(train_ds, shuffle=(train_sampler is None), sampler=train_sampler, drop_last=True, **common_kw) # ห้ามสุ่มซ้ำถ้าทำ ddp เพราะสุ่มใน sampler ไปแล้ว drop_last คือ ไม่ loop เติม data ให้ทุก gpu ได้ภาพเท่ากัน default=False ก็คือเติมให้
     val_loader = DataLoader(val_ds, shuffle=False, sampler=val_sampler, **common_kw)
     test_loader = DataLoader(test_ds, shuffle=False, sampler=test_sampler, **common_kw)
 
