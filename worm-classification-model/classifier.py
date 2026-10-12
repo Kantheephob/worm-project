@@ -7,7 +7,6 @@ import uuid
 from time import perf_counter
 from pathlib import Path
 from functools import partial
-
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -19,18 +18,16 @@ from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict, set_model_state_dict,
     get_state_dict, set_state_dict,
 )
-
 from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
-
 from data import get_dataloaders, worm_transforms
 from models import build_model, resolve_model_names, get_model_family, count_params
 from logger import TrainLogger
 from evaluate import (find_class_index, gather_eval_tensor, compute_metrics,
-                      make_threshold_grid, benchmark_inference)
+                      make_threshold_grid, benchmark_inference, save_predictions)
 from common import (set_seed, find_free_port, safe_torch_save, atomic_json_dump,
                     save_dcp_checkpoint, load_dcp_checkpoint, dcp_model_to_pt,
                     dist_barrier, dist_all_ok, dist_broadcast_bool)
@@ -120,6 +117,7 @@ DEFAULT_ARGS = {
     'infer_batch_size': c.INFER_BATCH_SIZE,
     'infer_warmup': c.INFER_WARMUP,
     'infer_iters': c.INFER_ITERS,
+    'save_val_predictions': c.SAVE_VAL_PREDICTIONS,
     'seed': c.SEED,
     'experiment_name': c.EXPERIMENT_NAME,
     'device': c.DEVICE,
@@ -228,6 +226,7 @@ class WormClassificationModel:
         ckpt_dir = base_dir / 'ckpt' / dataset_name / self.family
         log_dir = base_dir / 'log' / dataset_name / self.family
         tb_dir = base_dir / 'tb' / dataset_name / self.family
+        pred_dir = base_dir / 'pred' / dataset_name / self.family
 
         if is_main:
             print(f"[WormClassificationModel] experiment = '{self.experiment_name}' | dataset = '{dataset_name}'")
@@ -278,7 +277,7 @@ class WormClassificationModel:
                     print(f'\n{"=" * 60}\nTraining {model_name}\n{"=" * 60}')
                 results[model_name] = self._train_one(
                     model_name, train_loader, val_loader, test_loader, train_sampler, args, warmup_epochs,
-                    device, ckpt_dir, log_dir, tb_dir, is_main, is_distributed, rank,
+                    device, ckpt_dir, log_dir, tb_dir, pred_dir, is_main, is_distributed, rank,
                 )
 
         if is_main:
@@ -341,7 +340,7 @@ class WormClassificationModel:
     # One variant: train -> test -> benchmark -> log
     # ============================================================
     def _train_one(self, model_name, train_loader, val_loader, test_loader, train_sampler, args,
-                   warmup_epochs, device, ckpt_dir, log_dir, tb_dir, is_main, is_distributed, rank=0):
+                   warmup_epochs, device, ckpt_dir, log_dir, tb_dir, pred_dir, is_main, is_distributed, rank=0):
         a = self._variant_args(model_name, args)
         selection = a['selection_metric'] if self.pos_idx is not None else 'val_f1'
         amp_enabled, amp_dtype, use_scaler = _resolve_amp(a, device, is_main)
@@ -360,6 +359,8 @@ class WormClassificationModel:
             'cm_val_best_thr': log_dir / f'{model_name}_cm_val_best_perfect_at_thr.png',
             'cm_test': log_dir / f'{model_name}_cm_test.png',
             'cm_test_thr': log_dir / f'{model_name}_cm_test_perfect_at_thr.png',
+            'pred_val': pred_dir / model_name / 'val_predictions.csv',
+            'pred_test': pred_dir / model_name / 'test_predictions.csv',
         }
 
         if is_main:
@@ -416,19 +417,38 @@ class WormClassificationModel:
 
         dist_barrier()
 
-        # ---------------- test (all ranks) ----------------
+        # ---------------- test + per-image predictions (all ranks) ----------------
         test_m = None
+        thr = snap.get('val_threshold')
+        split_loaders = []
+        if a['save_val_predictions']:
+            split_loaders.append(('val', val_loader))
         if test_loader is not None:
+            split_loaders.append(('test', test_loader))
+
+        if split_loaders:
             model, _ = self._make_model(model_name, device, a, is_distributed)
             model_sd = get_model_state_dict(model)
             load_dcp_checkpoint({'model': model_sd}, paths['best'])
             set_model_state_dict(model, model_sd)
-            probs, labels = self._predict(model, test_loader, device, amp_enabled, amp_dtype)
-            test_m = compute_metrics(probs, labels, self.num_classes, self.pos_idx,
-                                     threshold=snap.get('val_threshold'))
-            del model, model_sd, probs, labels
+
+            for split, loader in split_loaders:
+                probs, labels = self._predict(model, loader, device, amp_enabled, amp_dtype)
+                if split == 'test':
+                    test_m = compute_metrics(probs, labels, self.num_classes, self.pos_idx, threshold=thr)
+                if is_main:
+                    try:
+                        counts = save_predictions(probs, labels, loader.dataset.samples, self.class_names,
+                                                  paths[f'pred_{split}'], pos_idx=self.pos_idx, threshold=thr)
+                        print(f"📝 {model_name}: saved {split} predictions -> {paths[f'pred_{split}']} {counts}")
+                    except Exception as e:
+                        print(f"⚠️ {model_name}: could not save {split} predictions: {e}")
+                del probs, labels
+
+            del model, model_sd
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
+        dist_barrier()
 
         # ---------------- inference benchmark (main GPU only) ----------------
         infer = {}

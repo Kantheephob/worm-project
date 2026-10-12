@@ -81,6 +81,6 @@ def get_dataloaders(dataset_dir, train_transform, eval_transform, batch_size, nu
     # 3. ทำเป็น dataloader
     train_loader = DataLoader(train_ds, shuffle=(train_sampler is None), sampler=train_sampler, drop_last=True, **common_kw) # ห้ามสุ่มซ้ำถ้าทำ ddp เพราะสุ่มใน sampler ไปแล้ว drop_last คือ ไม่ loop เติม data ให้ทุก gpu ได้ภาพเท่ากัน default=False ก็คือเติมให้
     val_loader = DataLoader(val_ds, shuffle=False, sampler=val_sampler, **common_kw)
-    test_loader = DataLoader(test_ds, shuffle=False, sampler=test_sampler, **common_kw)
+    test_loader = DataLoader(test_ds, shuffle=False, sampler=test_sampler, **common_kw) if test_ds is not None else None
 
     return train_loader, val_loader, test_loader, cls_names, num_class, train_sampler

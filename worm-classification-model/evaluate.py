@@ -2,6 +2,9 @@ from time import perf_counter
 import torch
 import torch.distributed as dist
 from torch.amp import autocast
+import csv
+import os
+from pathlib import Path
 
 
 def find_class_index(cls_names, candidates):
@@ -10,7 +13,7 @@ def find_class_index(cls_names, candidates):
     normalized = {name.strip().lower(): i for i, name in enumerate(cls_names)}  # class name มาจาก ImageFolder.classes
     # find positive index 
     for cand in candidates: # alter positive class name
-        idx = normalized.get(cand.stinp().lower())
+        idx = normalized.get(cand.strip().lower())
         if idx is not None:
             return idx
     return None
@@ -210,3 +213,58 @@ def benchmark_inference(model, img_size, device, amp_enabled=False, amp_dtype=to
     fps = batch_size * n_b / timed(xb, n_b)
  
     return {'inference_latency_ms': latency_ms, 'inference_fps': fps, 'inference_batch_size': batch_size}
+
+
+def save_predictions(probs, labels, samples, class_names, out_path, pos_idx=None, threshold=None):
+    """เขียน CSV 1 แถวต่อ 1 ภาพ (เรียงตาม dataset)
+    samples = ImageFolder.samples -> [(path, class_idx), ...]
+    outcome (Perfect = positive, ตัดสินด้วย P(Perfect) >= threshold):
+      TP = Perfect -> Perfect | FP = Other -> Perfect | FN = Perfect -> Other | TN = Other -> Other
+    """
+    probs = probs.detach().float().cpu()
+    labels = labels.detach().long().cpu()
+    n = probs.shape[0]
+    if len(samples) != n:
+        raise ValueError(f"save_predictions: {len(samples)} image paths but {n} predictions")
+    # check ว่าลำดับ prediction ตรงกับลำดับภาพ
+    mismatch = int((torch.tensor([s[1] for s in samples]) != labels).sum())
+    if mismatch:
+        raise ValueError(f"save_predictions: {mismatch} labels do not match the image list -> order is wrong")
+
+    preds = probs.argmax(1)
+    has_bin = pos_idx is not None and threshold is not None
+    if has_bin:
+        pos_name, neg_name = class_names[pos_idx], f'non-{class_names[pos_idx]}'
+        pred_pos = probs[:, pos_idx] >= threshold
+        true_pos = labels == pos_idx
+
+    fields = ['index', 'path', 'filename', 'true_label', 'pred_label', 'correct', 'confidence']
+    fields += [f'p_{name}' for name in class_names]
+    if has_bin:
+        fields += ['threshold', 'true_binary', 'pred_at_thr', 'outcome']
+
+    counts = {'n': n, 'TP': 0, 'FP': 0, 'FN': 0, 'TN': 0} if has_bin else {'n': n}
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(f'{out_path.name}.tmp{os.getpid()}')
+    with open(tmp_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for i in range(n):
+            t, p = int(labels[i]), int(preds[i])
+            row = {'index': i, 'path': samples[i][0], 'filename': Path(samples[i][0]).name,
+                   'true_label': class_names[t], 'pred_label': class_names[p], 'correct': int(t == p),
+                   'confidence': round(float(probs[i].max()), 5)}
+            for j, name in enumerate(class_names):
+                row[f'p_{name}'] = round(float(probs[i, j]), 5)
+            if has_bin:
+                tp_, pp_ = bool(true_pos[i]), bool(pred_pos[i])
+                outcome = ('TP' if pp_ else 'FN') if tp_ else ('FP' if pp_ else 'TN')
+                counts[outcome] += 1
+                row.update({'threshold': round(float(threshold), 4),
+                            'true_binary': pos_name if tp_ else neg_name,
+                            'pred_at_thr': pos_name if pp_ else neg_name,
+                            'outcome': outcome})
+            writer.writerow(row)
+    os.replace(tmp_path, out_path)   # atomic
+    return counts

@@ -62,7 +62,7 @@ DATASETS = {
 }
 
 # 2 class calculate
-GOOD_CLASS_NAMES = ['Perfect']
+POSITIVE_CLASS_NAMES = ['Perfect']
 
 # hardware & reproducibility
 SEED = 42
@@ -78,6 +78,8 @@ NUM_WORKERS = 8
 PIN_MEMORY = True
 
 # train
+OPTIMIZER_NAME = 'AdamW'
+FAMILY_LR = {}
 EPOCHS = 100
 LR = 1e-4
 WEIGHT_DECAY = 1e-4
@@ -92,10 +94,15 @@ EARLY_STOP_PATIENCE = 10
 FSDP_CPU_OFFLOAD =  True
 
 # opimal threshold search
-SELECTION_METRICS = 'val_f1_perfect'
+SELECTION_METRICS = 'val_f1_perfect_at_thr'
 THRESHOLD_GRID = (0.01, 0.99, 0.01) # start, stop, step
 
 # inference benchmark
 INFER_BATCH_SIZE = BATCH_SIZE
 INFER_WARMUP = 20   # เอาไว้อุ่นเครื่อง hardware / library
 INFER_ITERS = 100   # run จริง วัดจริง
+
+# predictions
+SAVE_VAL_PREDICTIONS = True
+GALLERY_K = 50
+GALLERY_COLS = 10
