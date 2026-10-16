@@ -10,7 +10,7 @@ import config as c
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train one dataset x one model (or family) on LANTA')
+    parser = argparse.ArgumentParser(description='Train one dataset x one model (or family) on LANTA / lab PC')
     parser.add_argument('--dataset', '-ds', type=str, required=True, choices=list(c.DATASETS.keys()),
                         help=f'Dataset key. Options: {list(c.DATASETS.keys())}')
     parser.add_argument('--model', '-m', type=str, required=True,
@@ -25,6 +25,11 @@ def main():
     parser.add_argument('--batch-size', type=int, default=None, help='Override BATCH_SIZE (per GPU)')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override LR for every variant (FAMILY_LR is ignored when set)')
+    parser.add_argument('--patience', type=int, default=None, help='Override EARLY_STOP_PATIENCE')
+    parser.add_argument('--cpu-offload', type=str, default=None, choices=['auto', 'on', 'off'],
+                        help='Override FSDP_CPU_OFFLOAD (auto = only for models that do not fit)')
+    parser.add_argument('--deterministic', action='store_true',
+                        help='cudnn deterministic algorithms (exact reruns, slower)')
     args = parser.parse_args()
 
     overrides = {}
@@ -34,6 +39,12 @@ def main():
         overrides['batch_size'] = args.batch_size
     if args.lr is not None:
         overrides['lr'] = args.lr
+    if args.patience is not None:
+        overrides['early_stop_patience'] = args.patience
+    if args.cpu_offload is not None:
+        overrides['fsdp_cpu_offload'] = {'auto': 'auto', 'on': True, 'off': False}[args.cpu_offload]
+    if args.deterministic:
+        overrides['deterministic'] = True
 
     if torch.cuda.is_available():
         n_gpus = min(args.num_gpus, torch.cuda.device_count())

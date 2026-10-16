@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import time
 import json
+import warnings
 from pathlib import Path
 import numpy as np
 import torch
@@ -14,15 +15,17 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
 
 
-def set_seed(seed):
-    """fixed randomness"""
+def set_seed(seed, deterministic=True):
+    """fixed randomness
+    deterministic=True  -> cudnn deterministic algorithms (exact reruns, slow backward)
+    deterministic=False -> cudnn.benchmark picks the fastest algorithms (still seeded)"""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = not bool(deterministic)
 
 
 def set_worker_seed(worker_id):
@@ -150,13 +153,16 @@ def save_dcp_checkpoint(state_dict, checkpoint_dir, retries=3, retry_delay=2.0):
     """แนะนำให้ใช้แทน torch.save เวลาต้อง save model มี่มาจากการทำ DDP / FSDP 
     แก้ปัญหาการ save แบบเก่าคือเวลา save ปกติจะรวมของทุกอย่างมาที่ rank 0 ทำให้เกิด 
     OOM ด้วยการ save ของใครของมันลงใน folder เดียวกัน ทำให้ auto-sharding ได้ 
-    เช่น เอาไปเทรนต่อด้วย 2 / 3 / 4 gpu"""
+    เช่น เอาไปเทรนต่อด้วย 2 / 3 / 4 gpu
+    (overwriting best/ and last/ every epoch is intended -> the 'existing checkpoint' warning is silenced)"""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)   # save folder
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            dcp.save(state_dict, checkpoint_id=str(checkpoint_dir)) # individual save
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='Detected an existing checkpoint')
+                dcp.save(state_dict, checkpoint_id=str(checkpoint_dir)) # individual save
             return True
         except Exception as e:
             last_err = e

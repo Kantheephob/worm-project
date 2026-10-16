@@ -4,6 +4,7 @@ import atexit
 import traceback
 import tempfile
 import uuid
+import warnings
 from time import perf_counter
 from pathlib import Path
 from functools import partial
@@ -32,6 +33,10 @@ from common import (set_seed, find_free_port, safe_torch_save, atomic_json_dump,
                     save_dcp_checkpoint, load_dcp_checkpoint, dcp_model_to_pt,
                     dist_barrier, dist_all_ok, dist_broadcast_bool)
 import config as c
+
+# known-harmless warnings that flood the log every epoch
+warnings.filterwarnings('ignore', message='Detected an existing checkpoint')              # DCP overwrite (intended)
+warnings.filterwarnings('ignore', message=r'The epoch parameter in `scheduler\.step\(\)`')  # raised inside SequentialLR
 
 if os.environ.get("LOCAL_RANK", "0") != "0" or os.environ.get("RANK", "0") != "0":
     sys.stdout = open(os.devnull, 'w')
@@ -94,6 +99,16 @@ def _prefixed(metrics, prefix):
     return {f'{prefix}_{k}': v for k, v in metrics.items() if not k.startswith('cm')}
 
 
+def _offload_mode(value):
+    """config / CLI value -> 'auto' | True | False"""
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v == 'auto':
+            return 'auto'
+        return v in ('true', 'on', '1', 'yes')
+    return bool(value)
+
+
 DEFAULT_ARGS = {
     'img_size': c.IMG_SIZE,
     'upscale': c.UPSCALE,
@@ -113,7 +128,10 @@ DEFAULT_ARGS = {
     'grad_clip_norm': c.GRAD_CLIP_NORM,
     'early_stop_patience': c.EARLY_STOP_PATIENCE,
     'fsdp_cpu_offload': c.FSDP_CPU_OFFLOAD,
-    'selection_metric': c.SELECTION_METRIC,
+    'fsdp_offload_mem_fraction': c.FSDP_OFFLOAD_MEM_FRACTION,
+    'deterministic': c.DETERMINISTIC,
+    'allow_tf32': c.ALLOW_TF32,
+    'selection_metric': c.SELECTION_METRICS,
     'infer_batch_size': c.INFER_BATCH_SIZE,
     'infer_warmup': c.INFER_WARMUP,
     'infer_iters': c.INFER_ITERS,
@@ -127,7 +145,7 @@ DEFAULT_ARGS = {
 
 class WormClassificationModel:
     def __init__(self, model_name, experiment_name=None, **overrides):
-        self.model_list = resolve_model_names(model_name)
+        self.model_list = resolve_model_names(model_name)   # family name -> every variant of that family
         self.family = model_name.lower()
         self.init_overrides = dict(overrides)
         self.args = {**DEFAULT_ARGS, **overrides}
@@ -220,7 +238,11 @@ class WormClassificationModel:
         else:
             device = torch.device(f'cuda:{devices[0]}' if devices[0] != 'cpu' else 'cpu')
 
-        set_seed(args['seed'])
+        set_seed(args['seed'], deterministic=args['deterministic'])
+        if args['allow_tf32']:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')
 
         base_dir = Path(args['output_dir']) / self.experiment_name
         ckpt_dir = base_dir / 'ckpt' / dataset_name / self.family
@@ -230,11 +252,15 @@ class WormClassificationModel:
 
         if is_main:
             print(f"[WormClassificationModel] experiment = '{self.experiment_name}' | dataset = '{dataset_name}'")
+            print(f"[WormClassificationModel] variants = {self.model_list}")
             print(f"[WormClassificationModel] Using {world_size} GPU(s) | FSDP2: {is_distributed} "
-                  f"(CPU offload: {args['fsdp_cpu_offload'] and is_distributed}) | Torchrun: {is_torchrun}")
+                  f"(CPU offload mode: {_offload_mode(args['fsdp_cpu_offload']) if is_distributed else 'n/a'}) "
+                  f"| Torchrun: {is_torchrun}")
+            print(f"[WormClassificationModel] deterministic={args['deterministic']} "
+                  f"(cudnn.benchmark={not args['deterministic']}) | tf32={args['allow_tf32']}")
             print(f"[WormClassificationModel] img_size={args['img_size']} upscale={args['upscale']} "
                   f"augment={args['augment']} | batch/GPU={args['batch_size']} "
-                  f"(effective {args['batch_size'] * world_size})")
+                  f"(effective {args['batch_size'] * world_size}) | patience={args['early_stop_patience']}")
             for d in (ckpt_dir, log_dir, tb_dir):
                 d.mkdir(parents=True, exist_ok=True)
 
@@ -303,19 +329,38 @@ class WormClassificationModel:
             a['lr'] = c.FAMILY_LR[fam]
         return a
 
-    def _make_model(self, model_name, device, a, is_distributed):
+    def _want_cpu_offload(self, param_count, device, a):
+        """Decide FSDP CPU offload for this model.
+        'auto': offload only if sharded fp32 params + grads + AdamW states (16 B/param / world)
+                plus one unsharded fp32 copy during forward/backward (4 B/param)
+                exceed fsdp_offload_mem_fraction of this GPU's memory.
+        Same GPU model on every rank -> every rank makes the same decision."""
+        mode = _offload_mode(a['fsdp_cpu_offload'])
+        if mode != 'auto':
+            return mode
+        if device.type != 'cuda':
+            return False
+        total = torch.cuda.get_device_properties(device).total_memory
+        world = max(self.world_size, 1)
+        need = param_count * (16 / world + 4)
+        return need > a['fsdp_offload_mem_fraction'] * total
+
+    def _make_model(self, model_name, device, a, is_distributed, is_main=False, verbose=False):
         model = build_model(model_name, self.num_classes, device=device)
         model.to(device)
         param_count = count_params(model)
         if is_distributed:
-            if a['fsdp_cpu_offload']:
+            offload = self._want_cpu_offload(param_count, device, a)
+            if verbose and is_main:
+                print(f"[FSDP2] {model_name}: {param_count / 1e6:.1f}M params | CPU offload = {offload}")
+            if offload:
                 model = fully_shard(model, offload_policy=CPUOffloadPolicy())
             else:
                 model = fully_shard(model)
         return model, param_count
 
     def _predict(self, model, loader, device, amp_enabled, amp_dtype):
-        """Softmax probabilities + labels for the whole loader (gathered from all GPUs, exact order)."""
+        """Softmax probabilities + labels for the whole loader (gathered from all GPUs, dataset order)."""
         model.eval()
         all_probs, all_labels = [], []
         with torch.no_grad():
@@ -427,7 +472,7 @@ class WormClassificationModel:
             split_loaders.append(('test', test_loader))
 
         if split_loaders:
-            model, _ = self._make_model(model_name, device, a, is_distributed)
+            model, _ = self._make_model(model_name, device, a, is_distributed, is_main=is_main, verbose=False)
             model_sd = get_model_state_dict(model)
             load_dcp_checkpoint({'model': model_sd}, paths['best'])
             set_model_state_dict(model, model_sd)
@@ -570,7 +615,7 @@ class WormClassificationModel:
     def _run_training_loop(self, model_name, train_loader, val_loader, train_sampler, a, warmup_epochs,
                            device, log_dir, tb_dir, is_main, is_distributed, paths, selection,
                            amp_enabled, amp_dtype, use_scaler, bin_names):
-        model, param_count = self._make_model(model_name, device, a, is_distributed)
+        model, param_count = self._make_model(model_name, device, a, is_distributed, is_main=is_main, verbose=True)
 
         criterion = CrossEntropyLoss()
         optim = AdamW(model.parameters(), lr=a['lr'], weight_decay=a['weight_decay'])

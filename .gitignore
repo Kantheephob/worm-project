@@ -10,3 +10,4 @@ onnx/
 ckpt/
 tb/
 logs/
+env/
