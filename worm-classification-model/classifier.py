@@ -28,7 +28,7 @@ from data import get_dataloaders, worm_transforms
 from models import build_model, resolve_model_names, get_model_family, count_params
 from logger import TrainLogger
 from evaluate import (find_class_index, gather_eval_tensor, compute_metrics,
-                      make_threshold_grid, benchmark_inference, save_predictions)
+                      benchmark_inference, save_predictions)
 from common import (set_seed, find_free_port, safe_torch_save, atomic_json_dump,
                     save_dcp_checkpoint, load_dcp_checkpoint, dcp_model_to_pt,
                     dist_barrier, dist_all_ok, dist_broadcast_bool)
@@ -42,6 +42,7 @@ if os.environ.get("LOCAL_RANK", "0") != "0" or os.environ.get("RANK", "0") != "0
     sys.stdout = open(os.devnull, 'w')
 
 LR_SCHEDULER_NAME = 'LinearLR(warmup) + CosineAnnealingLR'
+FALLBACK_SELECTION = 'val_all_f1_macro'   # datasets without a Perfect class
 
 
 # ============================================================
@@ -95,7 +96,7 @@ def _build_scheduler(optim, a, warmup_epochs):
 
 
 def _prefixed(metrics, prefix):
-    """{'f1': .9, 'cm': ...} -> {'val_f1': .9}  (confusion matrices dropped)."""
+    """{'ap': .9, 'cm': ...} -> {'val_ap': .9}  (confusion matrices dropped)."""
     return {f'{prefix}_{k}': v for k, v in metrics.items() if not k.startswith('cm')}
 
 
@@ -107,6 +108,11 @@ def _offload_mode(value):
             return 'auto'
         return v in ('true', 'on', '1', 'yes')
     return bool(value)
+
+
+def _f(x, nd=4):
+    """format a number that may be None"""
+    return 'n/a' if x is None else f'{x:.{nd}f}'
 
 
 DEFAULT_ARGS = {
@@ -131,7 +137,8 @@ DEFAULT_ARGS = {
     'fsdp_offload_mem_fraction': c.FSDP_OFFLOAD_MEM_FRACTION,
     'deterministic': c.DETERMINISTIC,
     'allow_tf32': c.ALLOW_TF32,
-    'selection_metric': c.SELECTION_METRICS,
+    'selection_metric': c.SELECTION_METRIC,
+    'target_precision': c.TARGET_PRECISION,
     'infer_batch_size': c.INFER_BATCH_SIZE,
     'infer_warmup': c.INFER_WARMUP,
     'infer_iters': c.INFER_ITERS,
@@ -280,10 +287,11 @@ class WormClassificationModel:
             if is_main:
                 if self.pos_idx is not None:
                     print(f"[Perfect] positive class = '{class_names[self.pos_idx]}' (index {self.pos_idx}) | "
+                          f"target precision = {args['target_precision']:.2f} | "
                           f"best epoch selected by '{args['selection_metric']}'")
                 else:
                     print(f"⚠️ [Perfect] none of POSITIVE_CLASS_NAMES={c.POSITIVE_CLASS_NAMES} found in "
-                          f"{class_names} — Perfect/threshold metrics skipped, selecting by 'val_f1'")
+                          f"{class_names} — Perfect/threshold metrics skipped, selecting by '{FALLBACK_SELECTION}'")
             dataloaders_ok = True
         except Exception as e:
             print(f"❌ [rank {rank}] Failed to build dataloaders for '{dataset_name}': {e}", file=sys.stderr)
@@ -387,7 +395,8 @@ class WormClassificationModel:
     def _train_one(self, model_name, train_loader, val_loader, test_loader, train_sampler, args,
                    warmup_epochs, device, ckpt_dir, log_dir, tb_dir, pred_dir, is_main, is_distributed, rank=0):
         a = self._variant_args(model_name, args)
-        selection = a['selection_metric'] if self.pos_idx is not None else 'val_f1'
+        selection = a['selection_metric'] if self.pos_idx is not None else FALLBACK_SELECTION
+        target = float(a['target_precision'])
         amp_enabled, amp_dtype, use_scaler = _resolve_amp(a, device, is_main)
         pos_name = self.class_names[self.pos_idx] if self.pos_idx is not None else None
         bin_names = [pos_name, f'non-{pos_name}'] if pos_name else None
@@ -397,7 +406,7 @@ class WormClassificationModel:
             'best': variant_ckpt_dir / 'best',                # DCP dir, model only
             'last': variant_ckpt_dir / 'last',                # DCP dir, model + optim (resume)
             'last_meta': variant_ckpt_dir / 'last_meta.pt',   # scheduler / counters (resume)
-            'best_meta': variant_ckpt_dir / 'best_meta.json', # best epoch + Perfect threshold
+            'best_meta': variant_ckpt_dir / 'best_meta.json', # best epoch + Perfect thresholds
             'best_pt': variant_ckpt_dir / 'best.pt',          # plain state_dict
             'config': log_dir / f'{model_name}_config.json',
             'cm_val_best': log_dir / f'{model_name}_cm_val_best.png',
@@ -418,13 +427,14 @@ class WormClassificationModel:
                 'class_names': self.class_names,
                 'positive_class': pos_name,
                 'selection_metric': selection,
+                'target_precision': target,
+                'threshold_search': 'exact (every unique val P(Perfect)); frozen for test',
                 'num_gpus': self.world_size,
                 'effective_batch_size': a['batch_size'] * self.world_size,
                 'optimizer': c.OPTIMIZER_NAME,
                 'lr_scheduler': LR_SCHEDULER_NAME,
                 'warmup_epochs_effective': warmup_epochs,
                 'amp_dtype_effective': str(amp_dtype) if amp_enabled else 'fp32',
-                'threshold_grid': c.THRESHOLD_GRID,
                 'args': a,
             }, paths['config'])
         dist_barrier()
@@ -464,7 +474,11 @@ class WormClassificationModel:
 
         # ---------------- test + per-image predictions (all ranks) ----------------
         test_m = None
-        thr = snap.get('val_threshold')
+        deploy_thr = snap.get('val_tgt_threshold')            # precision-target threshold from val
+        frozen = None
+        if self.pos_idx is not None and deploy_thr is not None:
+            frozen = {'tgt': deploy_thr, 'f1opt': snap.get('val_f1opt_threshold', deploy_thr)}
+
         split_loaders = []
         if a['save_val_predictions']:
             split_loaders.append(('val', val_loader))
@@ -480,11 +494,13 @@ class WormClassificationModel:
             for split, loader in split_loaders:
                 probs, labels = self._predict(model, loader, device, amp_enabled, amp_dtype)
                 if split == 'test':
-                    test_m = compute_metrics(probs, labels, self.num_classes, self.pos_idx, threshold=thr)
+                    test_m = compute_metrics(probs, labels, self.num_classes, self.pos_idx,
+                                             target_precision=target, thresholds=frozen)
                 if is_main:
                     try:
                         counts = save_predictions(probs, labels, loader.dataset.samples, self.class_names,
-                                                  paths[f'pred_{split}'], pos_idx=self.pos_idx, threshold=thr)
+                                                  paths[f'pred_{split}'], pos_idx=self.pos_idx,
+                                                  threshold=deploy_thr)
                         print(f"📝 {model_name}: saved {split} predictions -> {paths[f'pred_{split}']} {counts}")
                     except Exception as e:
                         print(f"⚠️ {model_name}: could not save {split} predictions: {e}")
@@ -520,10 +536,10 @@ class WormClassificationModel:
             if test_m is not None:
                 logger.log_confusion_matrix(test_m['cm'], self.class_names, snap['epoch'],
                                             'Confusion_Matrix/Test', png_path=paths['cm_test'])
-                if 'cm_thr' in test_m:
+                if 'cm_tgt' in test_m:
                     logger.log_confusion_matrix(
-                        test_m['cm_thr'], bin_names, snap['epoch'],
-                        f"Confusion_Matrix/Test_{pos_name}_at_thr_{snap['val_threshold']:.2f}",
+                        test_m['cm_tgt'], bin_names, snap['epoch'],
+                        f"Confusion_Matrix/Test_{pos_name}_at_target_precision",
                         png_path=paths['cm_test_thr'])
 
             summary = {
@@ -558,9 +574,11 @@ class WormClassificationModel:
                 'inference_fps': infer.get('inference_fps'),
                 'optuna_tuned': False,
                 'optuna_trial': None,
+                'selection_metric': selection,
+                'best_selection_value': snap.get(selection),
+                'target_precision': target,
                 'train_loss': snap['train_loss'],
                 'train_acc': snap['train_acc'],
-                'perfect_threshold': snap.get('val_threshold'),
                 **{k: v for k, v in snap.items() if k.startswith('val_')},
                 **test_p,
             }
@@ -568,9 +586,11 @@ class WormClassificationModel:
 
             hparam_metrics = {
                 f'hp/best_{selection}': snap.get(selection),
-                'hp/test_f1': test_p.get('test_f1'),
-                'hp/test_f1_2class': test_p.get('test_f1_2class'),
-                'hp/test_f1_perfect_at_thr': test_p.get('test_f1_perfect_at_thr'),
+                'hp/test_selection_score': test_p.get('test_selection_score'),
+                'hp/test_tgt_prec_perfect': test_p.get('test_tgt_prec_perfect'),
+                'hp/test_tgt_recall_perfect': test_p.get('test_tgt_recall_perfect'),
+                'hp/test_ap': test_p.get('test_ap'),
+                'hp/test_all_f1_macro': test_p.get('test_all_f1_macro'),
                 'hp/inference_latency_ms': infer.get('inference_latency_ms'),
             }
             logger.log_hparams(
@@ -578,16 +598,21 @@ class WormClassificationModel:
                          'experiment_name': self.experiment_name, 'img_size': a['img_size'],
                          'batch_size': a['batch_size'], 'lr': a['lr'], 'weight_decay': a['weight_decay'],
                          'warmup_epochs': warmup_epochs, 'eta_min': a['eta_min'], 'epochs': a['epochs'],
-                         'seed': a['seed'], 'augment': a['augment']},
+                         'seed': a['seed'], 'augment': a['augment'], 'target_precision': target},
                 metrics={k: v for k, v in hparam_metrics.items() if v is not None},
             )
             logger.close()
 
             if test_m is not None:
-                msg = f"🧪 {model_name} TEST | macro F1 {test_m['f1']:.4f}"
-                if 'f1_2class' in test_m:
-                    msg += (f" | {pos_name} F1 {test_m['f1_2class']:.4f} (argmax)"
-                            f" | {test_m['f1_perfect_at_thr']:.4f} @thr={snap['val_threshold']:.2f}")
+                msg = f"🧪 {model_name} TEST | macro F1 {test_m['all_f1_macro']:.4f}"
+                if 'tgt_threshold' in test_m:
+                    met = '✅' if test_m['tgt_met'] else '❌'
+                    msg += (f" | AP {_f(test_m['ap'])}"
+                            f" | {pos_name} argmax P {test_m['argmax_prec_perfect']:.4f}"
+                            f" R {test_m['argmax_recall_perfect']:.4f}"
+                            f" | @P>={target:.2f} (t={test_m['tgt_threshold']:.6f}):"
+                            f" P {test_m['tgt_prec_perfect']:.4f} R {test_m['tgt_recall_perfect']:.4f}"
+                            f" F1 {test_m['tgt_f1_perfect']:.4f} FP {test_m['tgt_fp']} {met}")
                 print(msg)
 
         return {
@@ -596,16 +621,23 @@ class WormClassificationModel:
             'stopped_epoch': out['stopped_epoch'],
             'selection_metric': selection,
             'best_selection_value': snap.get(selection),
-            'perfect_threshold': snap.get('val_threshold'),
+            'target_precision': target,
+            'perfect_threshold': deploy_thr,
+            'f1opt_threshold': snap.get('val_f1opt_threshold'),
             'base_lr': a['lr'],
             'param_count_m': out['param_count'] / 1e6,
             'model_size_mb': model_size_mb,
             'inference_latency_ms': infer.get('inference_latency_ms'),
             'inference_fps': infer.get('inference_fps'),
-            'test_f1': test_p.get('test_f1'),
-            'test_acc': test_p.get('test_acc'),
-            'test_f1_2class': test_p.get('test_f1_2class'),
-            'test_f1_perfect_at_thr': test_p.get('test_f1_perfect_at_thr'),
+            'test_selection_score': test_p.get('test_selection_score'),
+            'test_tgt_met': test_p.get('test_tgt_met'),
+            'test_tgt_prec_perfect': test_p.get('test_tgt_prec_perfect'),
+            'test_tgt_recall_perfect': test_p.get('test_tgt_recall_perfect'),
+            'test_tgt_f1_perfect': test_p.get('test_tgt_f1_perfect'),
+            'test_tgt_fp': test_p.get('test_tgt_fp'),
+            'test_ap': test_p.get('test_ap'),
+            'test_all_acc': test_p.get('test_all_acc'),
+            'test_all_f1_macro': test_p.get('test_all_f1_macro'),
             'ckpt_path': str(paths['best_pt']),
         }
 
@@ -623,8 +655,8 @@ class WormClassificationModel:
         scaler = GradScaler(device=device.type, enabled=use_scaler)
 
         logger = TrainLogger(model_name, log_dir=log_dir, tb_dir=tb_dir) if is_main else None
-        grid = make_threshold_grid(c.THRESHOLD_GRID, device=device)
-        metric_key = selection[len('val_'):]   # 'val_f1_perfect_at_thr' -> 'f1_perfect_at_thr'
+        target = float(a['target_precision'])
+        metric_key = selection[len('val_'):]   # 'val_selection_score' -> 'selection_score'
 
         st = {'epoch': 0, 'best_value': float('-inf'), 'best_epoch': 0, 'patience': 0,
               'best_snapshot': None, 'train_time_sec': 0.0, 'finished': False, 'param_count': param_count}
@@ -696,11 +728,14 @@ class WormClassificationModel:
             train_acc = (totals[1] / totals[2].clamp_min(1)).item()
             sched.step()
 
-            # ---- validate (threshold searched here) ----
+            # ---- validate (thresholds searched here, on val only) ----
             probs, labels = self._predict(model, val_loader, device, amp_enabled, amp_dtype)
-            m = compute_metrics(probs, labels, self.num_classes, self.pos_idx, threshold=None, grid=grid)
+            m = compute_metrics(probs, labels, self.num_classes, self.pos_idx, target_precision=target)
             del probs, labels
-            value = m[metric_key]
+            if metric_key not in m or m[metric_key] is None:
+                raise KeyError(f"selection metric '{selection}' not available. "
+                               f"Options: {sorted('val_' + k for k in m if not k.startswith('cm'))}")
+            value = float(m[metric_key])
             improved = dist_broadcast_bool(value > st['best_value'])
             epoch_time = perf_counter() - t0
 
@@ -708,20 +743,20 @@ class WormClassificationModel:
                 row = {
                     'epoch': epoch, 'current_lr': lr_used, 'current_weight_decay': wd_used,
                     'train_loss': train_loss, 'train_acc': train_acc,
-                    'val_loss': m['loss'], 'val_acc': m['acc'], 'val_prec': m['prec'],
-                    'val_recall': m['recall'], 'val_f1': m['f1'],
-                    'val_f1_perfect': m.get('f1_2class'),
-                    'val_best_threshold': m.get('threshold'),
-                    'val_f1_perfect_at_thr': m.get('f1_perfect_at_thr'),
+                    **_prefixed(m, 'val'),
                     'epoch_time_sec': epoch_time,
                 }
                 logger.log_epoch(row)
                 logger.log_confusion_matrix(m['cm'], self.class_names, epoch, 'Confusion_Matrix/Validation')
 
                 msg = (f" Ep {epoch:>3}/{a['epochs']} | {model_name} | loss {train_loss:.4f}/{m['loss']:.4f}"
-                       f" | val macro F1 {m['f1']:.4f}")
-                if 'f1_2class' in m:
-                    msg += f" | Perfect F1 {m['f1_2class']:.4f} | @thr {m['f1_perfect_at_thr']:.4f} (t={m['threshold']:.2f})"
+                       f" | macro F1 {m['all_f1_macro']:.4f}")
+                if 'tgt_threshold' in m:
+                    met = '✅' if m['tgt_met'] else '❌'
+                    msg += (f" | AP {_f(m['ap'])}"
+                            f" | argmax P/R {m['argmax_prec_perfect']:.4f}/{m['argmax_recall_perfect']:.4f}"
+                            f" | @P>={target:.2f}: P {m['tgt_prec_perfect']:.4f} R {m['tgt_recall_perfect']:.4f}"
+                            f" FP {m['tgt_fp']} t={m['tgt_threshold']:.6f} {met}")
                 msg += f" | LR {lr_used:.2e} | {epoch_time:.0f}s" + (" 🏆" if improved else "")
                 print(msg)
 
@@ -737,7 +772,12 @@ class WormClassificationModel:
                     atomic_json_dump({
                         'model_name': model_name, 'dataset_name': self.dataset_name, 'epoch': epoch,
                         'selection_metric': selection, 'selection_value': value,
-                        'threshold': m.get('threshold'),
+                        'target_precision': target,
+                        'threshold': m.get('tgt_threshold'),            # deploy threshold: P(Perfect) >= this
+                        'threshold_val_precision': m.get('tgt_prec_perfect'),
+                        'threshold_val_recall': m.get('tgt_recall_perfect'),
+                        'threshold_val_target_met': m.get('tgt_met'),
+                        'f1opt_threshold': m.get('f1opt_threshold'),    # reference only
                         'positive_class': self.class_names[self.pos_idx] if self.pos_idx is not None else None,
                         'positive_index': self.pos_idx, 'class_names': self.class_names,
                         'img_size': a['img_size'], 'upscale': a['upscale'],
@@ -745,10 +785,11 @@ class WormClassificationModel:
                     logger.save_confusion_matrix_png(m['cm'], self.class_names,
                                                      f'{model_name} | Val (best epoch {epoch})',
                                                      paths['cm_val_best'])
-                    if 'cm_thr' in m:
+                    if 'cm_tgt' in m:
                         logger.save_confusion_matrix_png(
-                            m['cm_thr'], bin_names,
-                            f"{model_name} | Val {bin_names[0]} @thr={m['threshold']:.2f} (epoch {epoch})",
+                            m['cm_tgt'], bin_names,
+                            f"{model_name} | Val {bin_names[0]} P>={target:.2f} "
+                            f"@thr={m['tgt_threshold']:.4f} (epoch {epoch})",
                             paths['cm_val_best_thr'])
             else:
                 st['patience'] += 1

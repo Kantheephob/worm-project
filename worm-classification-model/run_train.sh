@@ -3,9 +3,9 @@
 #   ./run_train.sh 2class_raw convnext
 #   ./run_train.sh 2class_raw convnext_tiny speed_test --epochs 1
 
-DATASET=${1:?dataset key required}      # 1st parameter required
+DATASET=${1:?dataset key required}      # 1st parameter required (? std error)
 MODEL=${2:?model or family required}    # 2nd parameter required
-EXPERIMENT=${3:-model_benchmark_v2}     # 3rd default parameter if not include
+EXPERIMENT=${3:-model-benchmark-v2}     # 3rd default parameter if not include
 # shift first 3 parameters, hide error if send less than 3 parameters or shift $# (total parameters)
 shift 3 2>/dev/null || shift $#
 EXTRA_ARGS=("$@")  # remaining parameters (array keeps arguments with spaces intact)

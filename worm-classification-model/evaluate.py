@@ -7,12 +7,26 @@ import os
 from pathlib import Path
 
 
+# column groups produced for every Perfect-vs-rest operating point
+#   argmax_*  -> Perfect vs rest using argmax (2-class dataset: same as threshold 0.5)
+#   tgt_*     -> Perfect vs rest using the PRECISION-TARGET threshold (deploy threshold)
+#   f1opt_*   -> Perfect vs rest using the F1-optimal threshold (reference only)
+BIN_METRICS = [
+    'acc',
+    'prec_perfect', 'recall_perfect', 'f1_perfect',     # Perfect = positive
+    'prec_other', 'recall_other', 'f1_other',           # non-Perfect = positive
+    'prec_macro', 'recall_macro', 'f1_macro',           # average of the two
+    'tp', 'fp', 'fn', 'tn',                             # fp = non-Perfect leaked as Perfect
+]
+BIN_OPS = ('argmax', 'tgt', 'f1opt')
+
+
 def find_class_index(cls_names, candidates):
     """หา index ของ positive class"""
     # create class index map
     normalized = {name.strip().lower(): i for i, name in enumerate(cls_names)}  # class name มาจาก ImageFolder.classes
-    # find positive index 
-    for cand in candidates: # alter positive class name
+    # find positive index
+    for cand in candidates:  # alter positive class name
         idx = normalized.get(cand.strip().lower())
         if idx is not None:
             return idx
@@ -23,7 +37,7 @@ def _is_dist():
     return dist.is_available() and dist.is_initialized()
 
 
-def gather_eval_tensor(t, dataset_len): # t = tensor model output จาก gpu แต่ละใบ, dataset_len = จำนวนภาพทั้งหมดใน dataset
+def gather_eval_tensor(t, dataset_len):  # t = tensor model output จาก gpu แต่ละใบ, dataset_len = จำนวนภาพทั้งหมดใน dataset
     """รวม model output จากทุก gpu กลับมา **เรียงตามลำดับ dataset** และตัดภาพที่ sampler วนซ้ำทิ้ง
 
     DistributedSampler(shuffle=False) แจกภาพแบบสลับกัน (interleave):
@@ -36,7 +50,7 @@ def gather_eval_tensor(t, dataset_len): # t = tensor model output จาก gpu 
     # check ว่าทำ distributed หรือไม่
     if not _is_dist():
         return t[:dataset_len]  # ส่ง tensor ขนาดเท่าจำนวน dataset กลับไป
- 
+
     world = dist.get_world_size()   # จำนวน gpu / จำนวน process
 
     # 1. ถามทุก gpu ว่ามีกี่ภาพ
@@ -68,18 +82,18 @@ def gather_eval_tensor(t, dataset_len): # t = tensor model output จาก gpu 
 
 
 def confusion_matrix(preds, labels, num_classes):
-    """นับจำนวนที่ทำนายถูก/ผิด แยกตามคลาส"""
+    """นับจำนวนที่ทำนายถูก/ผิด แยกตามคลาส (rows = true, cols = predicted)"""
     idx = labels.long() * num_classes + preds.long()
     return torch.bincount(idx, minlength=num_classes ** 2).reshape(num_classes, num_classes)
- 
- 
+
+
 def _safe_div(a, b):
     """หารอย่างปลอดภัย ป้องกันหารด้วยศูนย์"""
     return torch.where(b > 0, a / b.clamp_min(1e-12), torch.zeros_like(a))
- 
- 
+
+
 def metrics_from_cm(cm):
-    """คำนวณ Accuracy, Precision, Recall, F1 แบบ Macro"""
+    """All classes (argmax): Accuracy + macro Precision / Recall / F1"""
     cm = cm.double()
     tp = cm.diag()
     prec = _safe_div(tp, cm.sum(0))
@@ -87,85 +101,177 @@ def metrics_from_cm(cm):
     f1 = _safe_div(2 * prec * rec, prec + rec)
     return {
         'acc': (tp.sum() / cm.sum().clamp_min(1)).item(),
-        'prec': prec.mean().item(),
-        'recall': rec.mean().item(),
-        'f1': f1.mean().item(),
+        'prec_macro': prec.mean().item(),
+        'recall_macro': rec.mean().item(),
+        'f1_macro': f1.mean().item(),
     }
- 
- 
-def binary_metrics(pred_pos, true_pos):
-    """วัดผลแบบ 2 คลาส โดยถือ Perfect เป็น Positive"""
+
+
+def _prf(tp, fp, fn):
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
+    return prec, rec, f1
+
+
+def binary_block(pred_pos, true_pos):
+    """Perfect vs rest at one operating point.
+    Returns (metrics dict with BIN_METRICS keys, 2x2 cm [[TP, FN], [FP, TN]] rows = true)."""
     tp = int((pred_pos & true_pos).sum())
     fp = int((pred_pos & ~true_pos).sum())
     fn = int((~pred_pos & true_pos).sum())
     tn = int((~pred_pos & ~true_pos).sum())
     total = tp + fp + fn + tn
-    prec = tp / (tp + fp) if (tp + fp) else 0.0
-    rec = tp / (tp + fn) if (tp + fn) else 0.0
-    f1 = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0
-    acc = (tp + tn) / total if total else 0.0
+
+    p_pos, r_pos, f_pos = _prf(tp, fp, fn)   # Perfect as positive
+    p_neg, r_neg, f_neg = _prf(tn, fn, fp)   # non-Perfect as positive (roles swapped)
+
+    m = {
+        'acc': (tp + tn) / total if total else 0.0,
+        'prec_perfect': p_pos, 'recall_perfect': r_pos, 'f1_perfect': f_pos,
+        'prec_other': p_neg, 'recall_other': r_neg, 'f1_other': f_neg,
+        'prec_macro': (p_pos + p_neg) / 2, 'recall_macro': (r_pos + r_neg) / 2, 'f1_macro': (f_pos + f_neg) / 2,
+        'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
+    }
     cm = torch.tensor([[tp, fn], [fp, tn]], dtype=torch.long)
-    return {'acc': acc, 'prec': prec, 'recall': rec, 'f1': f1, 'cm': cm}
- 
- 
-def make_threshold_grid(spec=(0.01, 0.99, 0.01), device='cpu'):
-    """สร้างค่า Threshold ตั้งแต่ 0.01 ถึง 0.99 เพิ่มทีละ 0.01"""
-    start, stop, step = spec
-    return torch.arange(start, stop + step / 2, step, device=device, dtype=torch.float32)
- 
- 
-def find_best_threshold(p_pos, true_pos, grid):
-    """ทดลองทุก Threshold แล้วเลือกค่าที่ให้ F1 ของ Perfect สูงสุด"""
-    grid = grid.to(p_pos.device)
-    preds = p_pos.unsqueeze(0) >= grid.unsqueeze(1)  # (T, N)
-    y = true_pos.unsqueeze(0)
-    tp = (preds & y).sum(1).double()
-    fp = (preds & ~y).sum(1).double()
-    fn = (~preds & y).sum(1).double()
-    denom = 2 * tp + fp + fn
-    f1 = torch.where(denom > 0, 2 * tp / denom.clamp_min(1), torch.zeros_like(denom))
-    best = int(torch.argmax(f1))
-    return float(grid[best]), float(f1[best])
- 
- 
-def compute_metrics(probs, labels, num_classes, pos_idx=None, threshold=None, grid=None):
+    return m, cm
+
+
+# ============================================================
+# Exact threshold search (every unique P(Perfect) on the split, no 0.01 grid)
+# ============================================================
+def threshold_curve(p_pos, true_pos):
+    """Precision / recall / F1 for EVERY possible cut 'P(Perfect) >= thr'.
+    thr runs over the unique probabilities, highest first -> recall only goes up along the curve."""
+    p = p_pos.detach().double().flatten()
+    y = true_pos.detach().bool().flatten()
+    if p.numel() == 0:
+        return None
+    n_pos = int(y.sum())
+    n_neg = int(p.numel() - n_pos)
+
+    order = torch.argsort(p, descending=True)
+    p_s = p[order]
+    y_s = y[order].double()
+    tp = torch.cumsum(y_s, 0)
+    fp = torch.cumsum(1.0 - y_s, 0)
+
+    # tied probabilities must be cut together -> keep only the last index of each tie group
+    last = torch.ones_like(p_s, dtype=torch.bool)
+    if p_s.numel() > 1:
+        last[:-1] = p_s[:-1] != p_s[1:]
+    thr, tp, fp = p_s[last], tp[last], fp[last]
+
+    prec = tp / (tp + fp)                                    # tp + fp >= 1 always
+    rec = tp / n_pos if n_pos else torch.zeros_like(tp)
+    f1 = 2 * tp / (2 * tp + fp + (n_pos - tp)).clamp_min(1e-12)
+    return {'thr': thr, 'prec': prec, 'rec': rec, 'f1': f1, 'tp': tp, 'fp': fp,
+            'n_pos': n_pos, 'n_neg': n_neg}
+
+
+def average_precision(curve):
+    """PR-AUC (sklearn definition: sum of (R_n - R_{n-1}) * P_n). Threshold-free."""
+    if curve is None or curve['n_pos'] == 0:
+        return None
+    rec = curve['rec']
+    d_rec = torch.diff(rec, prepend=rec.new_zeros(1))
+    return float((d_rec * curve['prec']).sum())
+
+
+def roc_auc(curve):
+    """ROC-AUC from the same curve (trapezoid). Threshold-free."""
+    if curve is None or curve['n_pos'] == 0 or curve['n_neg'] == 0:
+        return None
+    zero = curve['rec'].new_zeros(1)
+    tpr = torch.cat([zero, curve['rec']])
+    fpr = torch.cat([zero, curve['fp'] / curve['n_neg']])
+    return float(torch.trapezoid(tpr, fpr))
+
+
+def pick_precision_threshold(curve, target):
+    """Lowest threshold whose precision >= target (= highest recall that keeps leakage <= 1 - target).
+    If no cut reaches the target -> the cut with the highest precision (largest recall among ties)."""
+    feasible = curve['prec'] >= target - 1e-9
+    if bool(feasible.any()):
+        idx = int(feasible.nonzero()[-1])
+    else:
+        pmax = curve['prec'].max()
+        idx = int((curve['prec'] >= pmax - 1e-12).nonzero()[-1])
+    return float(curve['thr'][idx])
+
+
+def pick_f1_threshold(curve):
+    """Threshold with the best Perfect F1 (reference only, not used for selection)."""
+    return float(curve['thr'][int(torch.argmax(curve['f1']))])
+
+
+def selection_score(prec, recall, target):
+    """recall if precision target is met, else (precision - 1) which is always < 0.
+    -> any model that meets the target beats every model that does not,
+       and training still 'improves' while it climbs toward the target (no early-stop stall)."""
+    return recall if prec >= target - 1e-9 else prec - 1.0
+
+
+def compute_metrics(probs, labels, num_classes, pos_idx=None, target_precision=0.95, thresholds=None):
     """All metrics from softmax probabilities.
- 
-    Keys:
-      loss, acc, prec, recall, f1, cm                    -> all classes (argmax, macro)
-      acc_2class, prec_2class, recall_2class, f1_2class, cm_2class
-                                                          -> Perfect vs rest, argmax
-      threshold, acc_perfect_at_thr, prec_perfect_at_thr, recall_perfect_at_thr, f1_perfect_at_thr, cm_thr
-                                                          -> Perfect vs rest, P(Perfect) >= threshold
-    threshold=None -> search the best one (use on val). Pass the val threshold for test.
+
+    Keys (always):
+      loss, all_acc, all_prec_macro, all_recall_macro, all_f1_macro, cm      -> all classes, argmax
+    Keys (when a Perfect class exists):
+      ap, roc_auc                                                             -> threshold-free
+      argmax_<BIN_METRICS>, cm_2class                                         -> Perfect vs rest, argmax
+      tgt_threshold, tgt_<BIN_METRICS>, cm_tgt                                -> P(Perfect) >= precision-target thr
+      f1opt_threshold, f1opt_<BIN_METRICS>, cm_f1opt                          -> P(Perfect) >= F1-optimal thr
+      tgt_met (1/0), selection_score
+
+    thresholds=None                        -> search both thresholds on THIS split (use on val)
+    thresholds={'tgt': t1, 'f1opt': t2}    -> apply frozen val thresholds (use on test)
     """
     out = {}
     labels = labels.long()
     p_true = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
     out['loss'] = (-torch.log(p_true.clamp_min(1e-12))).mean().item()  # = CrossEntropy
- 
+
     preds = probs.argmax(1)
     cm = confusion_matrix(preds, labels, num_classes)
-    out.update(metrics_from_cm(cm))
+    out.update({f'all_{k}': v for k, v in metrics_from_cm(cm).items()})
     out['cm'] = cm.cpu()
- 
-    if pos_idx is not None:
-        true_pos = labels == pos_idx
-        p_pos = probs[:, pos_idx]
- 
-        b = binary_metrics(preds == pos_idx, true_pos)
-        out.update({f'{k}_2class': v for k, v in b.items() if k != 'cm'})
-        out['cm_2class'] = b['cm']
- 
-        if threshold is None:
-            if grid is None:
-                grid = make_threshold_grid(device=probs.device)
-            threshold, _ = find_best_threshold(p_pos, true_pos, grid)
-        t = binary_metrics(p_pos >= threshold, true_pos)
-        out.update({f'{k}_perfect_at_thr': v for k, v in t.items() if k != 'cm'})
-        out['cm_thr'] = t['cm']
-        out['threshold'] = float(threshold)
- 
+
+    if pos_idx is None:
+        return out
+
+    true_pos = labels == pos_idx
+    p_pos = probs[:, pos_idx]
+
+    # threshold-free
+    curve = threshold_curve(p_pos, true_pos)
+    out['ap'] = average_precision(curve)
+    out['roc_auc'] = roc_auc(curve)
+
+    # argmax operating point
+    b, bcm = binary_block(preds == pos_idx, true_pos)
+    out.update({f'argmax_{k}': v for k, v in b.items()})
+    out['cm_2class'] = bcm
+
+    # threshold operating points
+    if thresholds is None:
+        if curve is None:
+            t_tgt = t_f1 = 0.5
+        else:
+            t_tgt = pick_precision_threshold(curve, target_precision)
+            t_f1 = pick_f1_threshold(curve)
+    else:
+        t_tgt, t_f1 = float(thresholds['tgt']), float(thresholds['f1opt'])
+
+    for op, t in (('tgt', t_tgt), ('f1opt', t_f1)):
+        b, bcm = binary_block(p_pos >= t, true_pos)
+        out.update({f'{op}_{k}': v for k, v in b.items()})
+        out[f'{op}_threshold'] = float(t)
+        out[f'cm_{op}'] = bcm
+
+    out['tgt_met'] = int(out['tgt_prec_perfect'] >= target_precision - 1e-9)
+    out['selection_score'] = selection_score(out['tgt_prec_perfect'], out['tgt_recall_perfect'],
+                                             target_precision)
     return out
 
 
@@ -173,38 +279,38 @@ def compute_metrics(probs, labels, num_classes, pos_idx=None, threshold=None, gr
 def benchmark_inference(model, img_size, device, amp_enabled=False, amp_dtype=torch.float16,
                         batch_size=64, warmup=20, iters=100):
     """Model forward time only (no data loading / preprocessing), synthetic input.
- 
+
     inference_latency_ms : time per image at batch size 1
     inference_fps        : images per second at batch_size
     """
     model.eval()
     is_cuda = device.type == 'cuda'
- 
+
     def sync():
         if is_cuda:
             torch.cuda.synchronize(device)
- 
+
     def run(x, n):
         for _ in range(n):
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                 model(x)
- 
+
     def timed(x, n):
         sync()
         t0 = perf_counter()
         run(x, n)
         sync()
         return perf_counter() - t0
- 
+
     x1 = torch.randn(1, 3, img_size, img_size, device=device)
     run(x1, warmup)
     latency_ms = timed(x1, iters) / iters * 1000
- 
+
     xb = torch.randn(batch_size, 3, img_size, img_size, device=device)
     n_b = max(10, iters // 4)
     run(xb, max(3, warmup // 4))
     fps = batch_size * n_b / timed(xb, n_b)
- 
+
     return {'inference_latency_ms': latency_ms, 'inference_fps': fps, 'inference_batch_size': batch_size}
 
 
@@ -247,14 +353,14 @@ def save_predictions(probs, labels, samples, class_names, out_path, pos_idx=None
             t, p = int(labels[i]), int(preds[i])
             row = {'index': i, 'path': samples[i][0], 'filename': Path(samples[i][0]).name,
                    'true_label': class_names[t], 'pred_label': class_names[p], 'correct': int(t == p),
-                   'confidence': round(float(probs[i].max()), 5)}
+                   'confidence': round(float(probs[i].max()), 6)}
             for j, name in enumerate(class_names):
-                row[f'p_{name}'] = round(float(probs[i, j]), 5)
+                row[f'p_{name}'] = round(float(probs[i, j]), 6)
             if has_bin:
                 tp_, pp_ = bool(true_pos[i]), bool(pred_pos[i])
                 outcome = ('TP' if pp_ else 'FN') if tp_ else ('FP' if pp_ else 'TN')
                 counts[outcome] += 1
-                row.update({'threshold': round(float(threshold), 4),
+                row.update({'threshold': round(float(threshold), 6),
                             'true_binary': pos_name if tp_ else neg_name,
                             'pred_at_thr': pos_name if pp_ else neg_name,
                             'outcome': outcome})

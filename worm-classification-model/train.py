@@ -30,6 +30,11 @@ def main():
                         help='Override FSDP_CPU_OFFLOAD (auto = only for models that do not fit)')
     parser.add_argument('--deterministic', action='store_true',
                         help='cudnn deterministic algorithms (exact reruns, slower)')
+    parser.add_argument('--target-precision', type=float, default=None,
+                        help=f'Override TARGET_PRECISION for Perfect (default {c.TARGET_PRECISION})')
+    parser.add_argument('--selection-metric', type=str, default=None,
+                        help=f"Override SELECTION_METRIC (default '{c.SELECTION_METRIC}'), "
+                             f"e.g. val_selection_score, val_ap, val_f1opt_f1_perfect")
     args = parser.parse_args()
 
     overrides = {}
@@ -45,6 +50,14 @@ def main():
         overrides['fsdp_cpu_offload'] = {'auto': 'auto', 'on': True, 'off': False}[args.cpu_offload]
     if args.deterministic:
         overrides['deterministic'] = True
+    if args.target_precision is not None:
+        if not 0.0 < args.target_precision <= 1.0:
+            parser.error('--target-precision must be in (0, 1]')
+        overrides['target_precision'] = args.target_precision
+    if args.selection_metric is not None:
+        if not args.selection_metric.startswith('val_'):
+            parser.error("--selection-metric must start with 'val_'")
+        overrides['selection_metric'] = args.selection_metric
 
     if torch.cuda.is_available():
         n_gpus = min(args.num_gpus, torch.cuda.device_count())

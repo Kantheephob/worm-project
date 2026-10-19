@@ -10,6 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms.functional import to_tensor
 
 from common import append_csv_row
+from evaluate import BIN_METRICS, BIN_OPS
 
 _SCI_KEYS = {'current_lr', 'current_weight_decay', 'base_lr', 'min_lr', 'weight_decay', 'best_lr'}
 _2DP_SUFFIXES = ('_sec', '_ms', '_fps', '_mb', '_m')
@@ -24,10 +25,39 @@ def _fmt(key, val):
     if isinstance(val, float):
         if key in _SCI_KEYS:
             return f'{val:.3e}'
-        if key.endswith(_2DP_SUFFIXES) or 'threshold' in key:
+        if 'threshold' in key:
+            return round(val, 6)          # overconfident models need e.g. 0.999812
+        if key.endswith(_2DP_SUFFIXES):
             return round(val, 2)
         return round(val, 4)
     return val
+
+
+def split_metric_cols(split):
+    """Every metric column for one split ('val' / 'test'), most important first."""
+    cols = [
+        f'{split}_selection_score', f'{split}_tgt_met', f'{split}_tgt_threshold',
+        f'{split}_tgt_prec_perfect', f'{split}_tgt_recall_perfect', f'{split}_tgt_fp',
+        f'{split}_ap', f'{split}_roc_auc',
+        f'{split}_loss',
+        f'{split}_all_acc', f'{split}_all_prec_macro', f'{split}_all_recall_macro', f'{split}_all_f1_macro',
+        f'{split}_f1opt_threshold',
+    ]
+    for op in BIN_OPS:
+        for m in BIN_METRICS:
+            col = f'{split}_{op}_{m}'
+            if col not in cols:
+                cols.append(col)
+    return cols
+
+
+def _tb_tag(key):
+    """'val_tgt_prec_perfect' -> 'val_tgt/prec_perfect'  |  'train_loss' -> 'train/loss'"""
+    split, rest = key.split('_', 1)
+    for op in ('all',) + BIN_OPS:
+        if rest.startswith(op + '_'):
+            return f'{split}_{op}/{rest[len(op) + 1:]}'
+    return f'{split}/{rest}'
 
 
 def plot_confusion_matrix(cm, class_names, title):
@@ -58,51 +88,33 @@ def plot_confusion_matrix(cm, class_names, title):
 
 
 class TrainLogger:
-    EPOCH_FIELDNAMES = [
-        'epoch', 'current_lr', 'current_weight_decay',
-        'train_loss', 'train_acc',
-        'val_loss', 'val_acc', 'val_prec', 'val_recall', 'val_f1',
-        'val_f1_perfect',           # Perfect F1 (argmax)
-        'val_best_threshold',       # best Perfect threshold this epoch
-        'val_f1_perfect_at_thr',    # Perfect F1 using that threshold
-        'epoch_time_sec',
-    ]
+    EPOCH_FIELDNAMES = (
+        ['epoch', 'current_lr', 'current_weight_decay', 'train_loss', 'train_acc']
+        + split_metric_cols('val')
+        + ['epoch_time_sec']
+    )
 
-    SUMMARY_FIELDNAMES = [
-        'variant', 'dataset_name',
-        # setting
-        'img_size', 'effective_batch_size', 'num_gpus',
-        'optimizer', 'lr_scheduler',
-        'base_lr', 'min_lr', 'weight_decay',
-        'warmup_epochs', 'warmup_ratio', 'warmup_start_factor', 'warmup_end_factor',
-        'max_epochs', 'early_stop_patience', 'grad_clip_norm',
-        'param_count_m', 'best_epoch', 'stopped_epoch', 'best_lr',
-        'total_train_time_sec', 'seed', 'use_amp', 'amp_dtype', 'augment',
-        'model_size_mb', 'inference_latency_ms', 'inference_fps',
-        'optuna_tuned', 'optuna_trial',
-        # results
-        'train_loss', 'train_acc',
-        'val_loss', 'val_acc', 'val_prec', 'val_recall', 'val_f1',
-        'test_loss', 'test_acc', 'test_prec', 'test_recall', 'test_f1',
-        'val_acc_2class', 'val_prec_2class', 'val_recall_2class', 'val_f1_2class',
-        'test_acc_2class', 'test_prec_2class', 'test_recall_2class', 'test_f1_2class',
-        # threshold
-        'perfect_threshold',
-        'val_prec_perfect_at_thr', 'val_recall_perfect_at_thr', 'val_f1_perfect_at_thr',
-        'test_prec_perfect_at_thr', 'test_recall_perfect_at_thr', 'test_f1_perfect_at_thr',
-    ]
+    SUMMARY_FIELDNAMES = (
+        ['variant', 'dataset_name',
+         # setting
+         'img_size', 'effective_batch_size', 'num_gpus',
+         'optimizer', 'lr_scheduler',
+         'base_lr', 'min_lr', 'weight_decay',
+         'warmup_epochs', 'warmup_ratio', 'warmup_start_factor', 'warmup_end_factor',
+         'max_epochs', 'early_stop_patience', 'grad_clip_norm',
+         'param_count_m', 'best_epoch', 'stopped_epoch', 'best_lr',
+         'total_train_time_sec', 'seed', 'use_amp', 'amp_dtype', 'augment',
+         'model_size_mb', 'inference_latency_ms', 'inference_fps',
+         'optuna_tuned', 'optuna_trial',
+         # selection
+         'selection_metric', 'best_selection_value', 'target_precision',
+         # results
+         'train_loss', 'train_acc']
+        + split_metric_cols('val')
+        + split_metric_cols('test')
+    )
 
-    _TB_EPOCH_TAGS = {
-        'Loss/train': 'train_loss',
-        'Loss/val': 'val_loss',
-        'Accuracy/train': 'train_acc',
-        'Accuracy/val': 'val_acc',
-        'Precision/val': 'val_prec',
-        'Recall/val': 'val_recall',
-        'F1/val_macro': 'val_f1',
-        'F1/val_perfect': 'val_f1_perfect',
-        'F1/val_perfect_at_thr': 'val_f1_perfect_at_thr',
-        'Threshold/val_best': 'val_best_threshold',
+    _TB_FIXED = {
         'LR': 'current_lr',
         'WeightDecay': 'current_weight_decay',
         'Time/epoch_sec': 'epoch_time_sec',
@@ -124,10 +136,13 @@ class TrainLogger:
         csv_row = {k: _fmt(k, row.get(k)) for k in self.EPOCH_FIELDNAMES}
         append_csv_row(self.log_path, csv_row, self.EPOCH_FIELDNAMES)
 
-        for tag, key in self._TB_EPOCH_TAGS.items():
+        for tag, key in self._TB_FIXED.items():
             val = row.get(key)
             if val is not None:
                 self.writer.add_scalar(tag, val, epoch)
+        for key, val in row.items():
+            if key.startswith(('train_', 'val_')) and isinstance(val, (int, float)) and not isinstance(val, bool):
+                self.writer.add_scalar(_tb_tag(key), val, epoch)
 
     def log_summary(self, summary):
         """summary: dict, keys outside SUMMARY_FIELDNAMES are ignored."""
