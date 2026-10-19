@@ -11,5 +11,7 @@ ckpt/
 tb/
 logs/
 env/
-model_benchmark_v2/
+model-benchmark-v2/
+model-benchmark-v2.tar.bz2
 env
+
