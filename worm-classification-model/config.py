@@ -83,9 +83,9 @@ YOLO26X_CLS_PATH = '/project/lt200264-saiwat/pretrained_models/Yolo/yolo26/yolo2
 OUTPUT_DIR = '/scratch/lt200264-saiwat/worm-project/worm-classification-model'
 
 # experiment name
-# NOTE: CSV columns changed (precision-target metrics) -> use a NEW experiment name,
-#       old CSVs / resume states from 'model-benchmark-v2' are not compatible
-EXPERIMENT_NAME = 'model-benchmark-v3'
+# NOTE: CSV columns changed (precision- and recall-locked metrics) -> use a NEW experiment name,
+#       old CSVs / resume states from 'model-benchmark-v2' / 'v3' are not compatible
+EXPERIMENT_NAME = 'model-benchmark'
 
 # dataset path
 # CLS2_BLACKOUT = '/home/ml_trainer/worm-project/datasets/cls2_blackout/'
@@ -152,18 +152,21 @@ EARLY_STOP_PATIENCE = 10
 FSDP_CPU_OFFLOAD = 'auto'
 FSDP_OFFLOAD_MEM_FRACTION = 0.5
 
-# model selection (Perfect = positive class)
-# Threshold is searched EXACTLY on val (every unique P(Perfect)), frozen and reused for test / inference.
-#   tgt   threshold = lowest threshold with Perfect precision >= TARGET_PRECISION (max recall, leak <= 5%)
-#   f1opt threshold = best Perfect F1 (logged for reference only)
-TARGET_PRECISION = 0.95
+# operating points (Perfect = positive class)
+# Every threshold is searched EXACTLY on val (every unique P(Perfect)), frozen and reused for test / inference.
+#   precision-locked p85 / p90 / p95: "basket must be >= X% Perfect"      -> keep as many Perfect as possible
+#   recall-locked    r80 / r90 / r95: "must keep >= X% of all Perfect"     -> basket as clean as possible
+#   f1opt: best Perfect F1 (reference only)
+# all of them are logged in ONE training run -> choose the operating point later, no retraining
+PRECISION_TARGETS = [0.80, 0.85, 0.90, 0.95]
+RECALL_TARGETS = [0.80, 0.85, 0.90, 0.95]
 # what decides the best epoch (any 'val_*' key from evaluate.compute_metrics works), e.g.
-#   'val_selection_score'   -> recall @ precision >= TARGET_PRECISION (recommended)
-#                              (if the target is not reached: precision - 1, always < 0)
-#   'val_ap'                -> PR-AUC of Perfect (threshold-free)
-#   'val_f1opt_f1_perfect'  -> old behaviour (best Perfect F1)
+#   'val_ap'                  -> PR-AUC of Perfect, threshold-free, fair to both P and R (recommended)
+#   'val_p95_recall_perfect'  -> recall when precision is locked at 0.95
+#   'val_r90_prec_perfect'    -> precision when recall is locked at 0.90
+#   'val_f1opt_f1_perfect'    -> old behaviour (best Perfect F1)
 # datasets without a Perfect class fall back to 'val_all_f1_macro'
-SELECTION_METRIC = 'val_selection_score'
+SELECTION_METRIC = 'val_ap'
 
 # inference benchmark
 INFER_BATCH_SIZE = BATCH_SIZE

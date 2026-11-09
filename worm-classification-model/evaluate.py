@@ -2,15 +2,19 @@ from time import perf_counter
 import torch
 import torch.distributed as dist
 from torch.amp import autocast
+import numpy as np
 import csv
 import os
 from pathlib import Path
 
 
-# column groups produced for every Perfect-vs-rest operating point
-#   argmax_*  -> Perfect vs rest using argmax (2-class dataset: same as threshold 0.5)
-#   tgt_*     -> Perfect vs rest using the PRECISION-TARGET threshold (deploy threshold)
-#   f1opt_*   -> Perfect vs rest using the F1-optimal threshold (reference only)
+# ============================================================
+# Operating points (Perfect = positive class)
+#   argmax   -> Perfect vs rest using argmax (2-class dataset: same as threshold 0.5)
+#   p85/p90/p95 ... -> precision-locked: lowest threshold with Perfect precision >= target (max recall)
+#   r80/r90/r95 ... -> recall-locked:    threshold with Perfect recall >= target and max precision
+#   f1opt    -> threshold with the best Perfect F1 (reference only)
+# ============================================================
 BIN_METRICS = [
     'acc',
     'prec_perfect', 'recall_perfect', 'f1_perfect',     # Perfect = positive
@@ -18,7 +22,21 @@ BIN_METRICS = [
     'prec_macro', 'recall_macro', 'f1_macro',           # average of the two
     'tp', 'fp', 'fn', 'tn',                             # fp = non-Perfect leaked as Perfect
 ]
-BIN_OPS = ('argmax', 'tgt', 'f1opt')
+
+
+def _pct(t):
+    """0.95 -> '95', 0.955 -> '95_5'"""
+    return f'{float(t) * 100:g}'.replace('.', '_')
+
+
+def target_ops(precision_targets=(), recall_targets=()):
+    """-> [(name, kind, target), ...] e.g. [('p85', 'precision', 0.85), ..., ('r90', 'recall', 0.9)]"""
+    ops = []
+    for t in sorted({float(x) for x in precision_targets}):
+        ops.append((f'p{_pct(t)}', 'precision', t))
+    for t in sorted({float(x) for x in recall_targets}):
+        ops.append((f'r{_pct(t)}', 'recall', t))
+    return ops
 
 
 def find_class_index(cls_names, candidates):
@@ -137,6 +155,14 @@ def binary_block(pred_pos, true_pos):
     return m, cm
 
 
+def by_class_block(pred_pos, labels, num_classes):
+    """Multi-class breakdown at one operating point: rows = every TRUE class, cols = [Perfect, Others].
+    -> shows WHICH non-Perfect class leaks into the Perfect basket at this threshold.
+    shape (num_classes, 2): [:, 0] = picked as Perfect, [:, 1] = rejected (Others)"""
+    idx = labels.long() * 2 + (~pred_pos).long()
+    return torch.bincount(idx, minlength=num_classes * 2).reshape(num_classes, 2).cpu()
+
+
 # ============================================================
 # Exact threshold search (every unique P(Perfect) on the split, no 0.01 grid)
 # ============================================================
@@ -189,7 +215,8 @@ def roc_auc(curve):
 
 
 def pick_precision_threshold(curve, target):
-    """Lowest threshold whose precision >= target (= highest recall that keeps leakage <= 1 - target).
+    """Precision-locked: lowest threshold whose precision >= target
+    (= the deepest cut that still keeps the basket clean -> highest recall).
     If no cut reaches the target -> the cut with the highest precision (largest recall among ties)."""
     feasible = curve['prec'] >= target - 1e-9
     if bool(feasible.any()):
@@ -200,32 +227,50 @@ def pick_precision_threshold(curve, target):
     return float(curve['thr'][idx])
 
 
+def pick_recall_threshold(curve, target):
+    """Recall-locked: among cuts with recall >= target, the one with the highest precision
+    (ties -> the higher threshold = fewer picks). If none reach it -> take everything (last cut)."""
+    feasible = curve['rec'] >= target - 1e-9
+    if bool(feasible.any()):
+        idx_f = feasible.nonzero().squeeze(1)
+        idx = int(idx_f[int(torch.argmax(curve['prec'][idx_f]))])   # argmax returns the first max
+    else:
+        idx = curve['thr'].numel() - 1
+    return float(curve['thr'][idx])
+
+
 def pick_f1_threshold(curve):
-    """Threshold with the best Perfect F1 (reference only, not used for selection)."""
+    """Threshold with the best Perfect F1 (reference only)."""
     return float(curve['thr'][int(torch.argmax(curve['f1']))])
 
 
-def selection_score(prec, recall, target):
-    """recall if precision target is met, else (precision - 1) which is always < 0.
-    -> any model that meets the target beats every model that does not,
-       and training still 'improves' while it climbs toward the target (no early-stop stall)."""
-    return recall if prec >= target - 1e-9 else prec - 1.0
+def _curve_for_plot(curve, max_points=5000):
+    """Small CPU numpy copy of the PR curve (for the PR-curve PNG)."""
+    rec = curve['rec'].detach().cpu().numpy()
+    prec = curve['prec'].detach().cpu().numpy()
+    if rec.size > max_points:
+        idx = np.unique(np.linspace(0, rec.size - 1, max_points).astype(np.int64))
+        rec, prec = rec[idx], prec[idx]
+    return {'rec': rec, 'prec': prec}
 
 
-def compute_metrics(probs, labels, num_classes, pos_idx=None, target_precision=0.95, thresholds=None):
+def compute_metrics(probs, labels, num_classes, pos_idx=None, ops=(), thresholds=None):
     """All metrics from softmax probabilities.
 
     Keys (always):
       loss, all_acc, all_prec_macro, all_recall_macro, all_f1_macro, cm      -> all classes, argmax
     Keys (when a Perfect class exists):
-      ap, roc_auc                                                             -> threshold-free
-      argmax_<BIN_METRICS>, cm_2class                                         -> Perfect vs rest, argmax
-      tgt_threshold, tgt_<BIN_METRICS>, cm_tgt                                -> P(Perfect) >= precision-target thr
-      f1opt_threshold, f1opt_<BIN_METRICS>, cm_f1opt                          -> P(Perfect) >= F1-optimal thr
-      tgt_met (1/0), selection_score
+      ap, roc_auc                                      -> threshold-free
+      argmax_<BIN_METRICS>, cm_argmax                  -> Perfect vs rest, argmax
+      <op>_threshold, <op>_met, <op>_<BIN_METRICS>, cm_<op>   for every op in `ops` (p85, r90, ...)
+      f1opt_threshold, f1opt_<BIN_METRICS>, cm_f1opt   -> best-F1 threshold (reference)
+      cm_<op>_by_class                                 -> (num_classes, 2) rows = true class, cols = [Perfect, Others]
+                                                          (only when num_classes > 2)
+      curve                                            -> {'rec', 'prec'} numpy, for the PR plot
 
-    thresholds=None                        -> search both thresholds on THIS split (use on val)
-    thresholds={'tgt': t1, 'f1opt': t2}    -> apply frozen val thresholds (use on test)
+    ops        = evaluate.target_ops(...)
+    thresholds = None            -> search every threshold on THIS split (use on val)
+                 {op_name: t}    -> apply frozen val thresholds (use on test), must include 'f1opt'
     """
     out = {}
     labels = labels.long()
@@ -247,31 +292,41 @@ def compute_metrics(probs, labels, num_classes, pos_idx=None, target_precision=0
     curve = threshold_curve(p_pos, true_pos)
     out['ap'] = average_precision(curve)
     out['roc_auc'] = roc_auc(curve)
+    out['curve'] = _curve_for_plot(curve) if curve is not None else None
 
     # argmax operating point
     b, bcm = binary_block(preds == pos_idx, true_pos)
     out.update({f'argmax_{k}': v for k, v in b.items()})
-    out['cm_2class'] = bcm
+    out['cm_argmax'] = bcm
 
-    # threshold operating points
+    # thresholds: search (val) or frozen (test)
     if thresholds is None:
-        if curve is None:
-            t_tgt = t_f1 = 0.5
-        else:
-            t_tgt = pick_precision_threshold(curve, target_precision)
-            t_f1 = pick_f1_threshold(curve)
+        thr = {}
+        for name, kind, target in ops:
+            if curve is None:
+                thr[name] = 0.5
+            elif kind == 'precision':
+                thr[name] = pick_precision_threshold(curve, target)
+            else:
+                thr[name] = pick_recall_threshold(curve, target)
+        thr['f1opt'] = pick_f1_threshold(curve) if curve is not None else 0.5
     else:
-        t_tgt, t_f1 = float(thresholds['tgt']), float(thresholds['f1opt'])
+        thr = {k: float(v) for k, v in thresholds.items()}
 
-    for op, t in (('tgt', t_tgt), ('f1opt', t_f1)):
-        b, bcm = binary_block(p_pos >= t, true_pos)
-        out.update({f'{op}_{k}': v for k, v in b.items()})
-        out[f'{op}_threshold'] = float(t)
-        out[f'cm_{op}'] = bcm
+    for name, kind, target in list(ops) + [('f1opt', None, None)]:
+        t = thr[name]
+        pred_pos = p_pos >= t
+        b, bcm = binary_block(pred_pos, true_pos)
+        out.update({f'{name}_{k}': v for k, v in b.items()})
+        out[f'{name}_threshold'] = float(t)
+        out[f'cm_{name}'] = bcm
+        if num_classes > 2:
+            out[f'cm_{name}_by_class'] = by_class_block(pred_pos, labels, num_classes)
+        if kind == 'precision':
+            out[f'{name}_met'] = int(b['prec_perfect'] >= target - 1e-9)
+        elif kind == 'recall':
+            out[f'{name}_met'] = int(b['recall_perfect'] >= target - 1e-9)
 
-    out['tgt_met'] = int(out['tgt_prec_perfect'] >= target_precision - 1e-9)
-    out['selection_score'] = selection_score(out['tgt_prec_perfect'], out['tgt_recall_perfect'],
-                                             target_precision)
     return out
 
 
@@ -314,11 +369,13 @@ def benchmark_inference(model, img_size, device, amp_enabled=False, amp_dtype=to
     return {'inference_latency_ms': latency_ms, 'inference_fps': fps, 'inference_batch_size': batch_size}
 
 
-def save_predictions(probs, labels, samples, class_names, out_path, pos_idx=None, threshold=None):
+def save_predictions(probs, labels, samples, class_names, out_path, pos_idx=None, thresholds=None):
     """เขียน CSV 1 แถวต่อ 1 ภาพ (เรียงตาม dataset)
-    samples = ImageFolder.samples -> [(path, class_idx), ...]
+    samples    = ImageFolder.samples -> [(path, class_idx), ...]
+    thresholds = {op_name: t} (e.g. {'p95': 0.96, 'r90': 0.31}) -> one pred_/outcome_ column pair per op
     outcome (Perfect = positive, ตัดสินด้วย P(Perfect) >= threshold):
       TP = Perfect -> Perfect | FP = Other -> Perfect | FN = Perfect -> Other | TN = Other -> Other
+    returns {'n': N, 'FP_<op>': ..., 'FN_<op>': ...}
     """
     probs = probs.detach().float().cpu()
     labels = labels.detach().long().cpu()
@@ -331,18 +388,24 @@ def save_predictions(probs, labels, samples, class_names, out_path, pos_idx=None
         raise ValueError(f"save_predictions: {mismatch} labels do not match the image list -> order is wrong")
 
     preds = probs.argmax(1)
-    has_bin = pos_idx is not None and threshold is not None
+    thresholds = dict(thresholds or {})
+    has_bin = pos_idx is not None and bool(thresholds)
+    counts = {'n': n}
     if has_bin:
-        pos_name, neg_name = class_names[pos_idx], f'non-{class_names[pos_idx]}'
-        pred_pos = probs[:, pos_idx] >= threshold
+        pos_name, neg_name = class_names[pos_idx], 'Others'
         true_pos = labels == pos_idx
+        pred_pos = {op: probs[:, pos_idx] >= t for op, t in thresholds.items()}
+        for op in thresholds:
+            counts[f'FP_{op}'] = 0
+            counts[f'FN_{op}'] = 0
 
     fields = ['index', 'path', 'filename', 'true_label', 'pred_label', 'correct', 'confidence']
     fields += [f'p_{name}' for name in class_names]
     if has_bin:
-        fields += ['threshold', 'true_binary', 'pred_at_thr', 'outcome']
+        fields += ['true_binary']
+        for op in thresholds:
+            fields += [f'pred_{op}', f'outcome_{op}']
 
-    counts = {'n': n, 'TP': 0, 'FP': 0, 'FN': 0, 'TN': 0} if has_bin else {'n': n}
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_name(f'{out_path.name}.tmp{os.getpid()}')
@@ -357,13 +420,15 @@ def save_predictions(probs, labels, samples, class_names, out_path, pos_idx=None
             for j, name in enumerate(class_names):
                 row[f'p_{name}'] = round(float(probs[i, j]), 6)
             if has_bin:
-                tp_, pp_ = bool(true_pos[i]), bool(pred_pos[i])
-                outcome = ('TP' if pp_ else 'FN') if tp_ else ('FP' if pp_ else 'TN')
-                counts[outcome] += 1
-                row.update({'threshold': round(float(threshold), 6),
-                            'true_binary': pos_name if tp_ else neg_name,
-                            'pred_at_thr': pos_name if pp_ else neg_name,
-                            'outcome': outcome})
+                tp_ = bool(true_pos[i])
+                row['true_binary'] = pos_name if tp_ else neg_name
+                for op in thresholds:
+                    pp_ = bool(pred_pos[op][i])
+                    outcome = ('TP' if pp_ else 'FN') if tp_ else ('FP' if pp_ else 'TN')
+                    if outcome in ('FP', 'FN'):
+                        counts[f'{outcome}_{op}'] += 1
+                    row[f'pred_{op}'] = pos_name if pp_ else neg_name
+                    row[f'outcome_{op}'] = outcome
             writer.writerow(row)
     os.replace(tmp_path, out_path)   # atomic
     return counts

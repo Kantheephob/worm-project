@@ -9,6 +9,13 @@ from common import atomic_json_dump
 import config as c
 
 
+def _targets(parser, values, flag):
+    for v in values:
+        if not 0.0 < v <= 1.0:
+            parser.error(f'{flag} values must be in (0, 1], got {v}')
+    return sorted(set(values))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train one dataset x one model (or family) on LANTA / lab PC')
     parser.add_argument('--dataset', '-ds', type=str, required=True, choices=list(c.DATASETS.keys()),
@@ -30,11 +37,15 @@ def main():
                         help='Override FSDP_CPU_OFFLOAD (auto = only for models that do not fit)')
     parser.add_argument('--deterministic', action='store_true',
                         help='cudnn deterministic algorithms (exact reruns, slower)')
-    parser.add_argument('--target-precision', type=float, default=None,
-                        help=f'Override TARGET_PRECISION for Perfect (default {c.TARGET_PRECISION})')
+    parser.add_argument('--precision-targets', type=float, nargs='+', default=None,
+                        help=f'Override PRECISION_TARGETS, e.g. --precision-targets 0.85 0.9 0.95 '
+                             f'(default {c.PRECISION_TARGETS})')
+    parser.add_argument('--recall-targets', type=float, nargs='+', default=None,
+                        help=f'Override RECALL_TARGETS, e.g. --recall-targets 0.8 0.9 0.95 '
+                             f'(default {c.RECALL_TARGETS})')
     parser.add_argument('--selection-metric', type=str, default=None,
                         help=f"Override SELECTION_METRIC (default '{c.SELECTION_METRIC}'), "
-                             f"e.g. val_selection_score, val_ap, val_f1opt_f1_perfect")
+                             f"e.g. val_ap, val_p95_recall_perfect, val_r90_prec_perfect")
     args = parser.parse_args()
 
     overrides = {}
@@ -50,10 +61,10 @@ def main():
         overrides['fsdp_cpu_offload'] = {'auto': 'auto', 'on': True, 'off': False}[args.cpu_offload]
     if args.deterministic:
         overrides['deterministic'] = True
-    if args.target_precision is not None:
-        if not 0.0 < args.target_precision <= 1.0:
-            parser.error('--target-precision must be in (0, 1]')
-        overrides['target_precision'] = args.target_precision
+    if args.precision_targets is not None:
+        overrides['precision_targets'] = _targets(parser, args.precision_targets, '--precision-targets')
+    if args.recall_targets is not None:
+        overrides['recall_targets'] = _targets(parser, args.recall_targets, '--recall-targets')
     if args.selection_metric is not None:
         if not args.selection_metric.startswith('val_'):
             parser.error("--selection-metric must start with 'val_'")

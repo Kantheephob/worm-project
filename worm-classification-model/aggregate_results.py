@@ -1,90 +1,115 @@
-"""
-รวม summary.csv ของทุก dataset/family ใน experiment เดียว เป็น Excel workbook เดียว
-
-โครงสร้าง workbook ที่ได้:
-  - 1 sheet ต่อ 1 family (convnext, resnet, vit, swin, swin_v2, efficientnet_v2, yolo26)
-    รวมทุก dataset ไว้ในตารางเดียว มีคอลัมน์ 'dataset' บอกที่มา
-    -> ใช้เทียบ performance ของ family เดียวกันข้าม dataset ได้ในตารางเดียว
-  - 1 sheet ต่อ 1 dataset (2class, 5class, ...)
-    รวมทุก family ไว้ในตารางเดียว มีคอลัมน์ 'family' บอกที่มา
-    -> ใช้เทียบ family ต่างๆ บน dataset เดียวกัน
-
-ใช้:
-    python aggregate_results.py --experiment model_benchmark
-    python aggregate_results.py --experiment model_benchmark --output /path/to/report.xlsx
-"""
-import argparse
-from pathlib import Path
-
 import pandas as pd
-
+from pathlib import Path
+import argparse
+import re
 import config as c
 
 
-def collect_all_runs(experiment_dir: Path) -> pd.DataFrame:
-    """อ่าน summary.csv ทุกไฟล์ใต้ log/<dataset>/<family>/summary.csv
-    คืน DataFrame เดียวรวมทุกอย่าง พร้อมคอลัมน์ 'dataset' และ 'family'"""
-    log_root = experiment_dir / 'log'
-    frames = []
-
-    for dataset_dir in sorted(log_root.iterdir()):
-        if not dataset_dir.is_dir():
-            continue
-        for family_dir in sorted(dataset_dir.iterdir()):
-            summary_path = family_dir / 'summary.csv'
-            if summary_path.exists():
-                df = pd.read_csv(summary_path)
-                df.insert(0, 'dataset', dataset_dir.name)
-                df.insert(0, 'family', family_dir.name)
-                frames.append(df)
-
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
-def split_by(df: pd.DataFrame, key: str, sort_by: list[str]) -> dict[str, pd.DataFrame]:
-    """แยก DataFrame รวมออกเป็น dict ตามคอลัมน์ key เช่น 'family' หรือ 'dataset'"""
-    result = {}
-    for value in sorted(df[key].unique()):
-        sub = df[df[key] == value].sort_values(sort_by).reset_index(drop=True)
-        result[value] = sub
-    return result
+def combine_results(root_folder):
+    work_folder = root_folder / 'log'
+    out_file = root_folder / ('all_' + root_folder.name + '_results.xlsx')
+    
+    if not work_folder.exists():
+        print(f'Directory {root_folder} not found.')
+        return
+    
+    found_file = False
+    df_list = []
+    
+    for f in work_folder.rglob('summary.csv'):
+        found_file = True
+        print(f'Reading: {f}')
+        
+        try:
+            df = pd.read_csv(f)
+            df_list.append(df)
+            
+        except Exception as e:
+            print(f'Error reading {f}: {e}')
+    
+    if not found_file or not df_list:
+        print(f"No 'summary.csv file' found in {work_folder}")
+        return
+    
+    # combine all data        
+    df_master = pd.concat(df_list, ignore_index=True) 
+    
+    # helper function for handle sheet name limitation
+    def clean_sheet_name(name):
+        cleaned = ''.join(ch for ch in str(name) if ch.isalnum() or ch in ('_', ' ', '-'))  # isalnum คือ เช็คว่าเป็น alphabet or number
+        return cleaned[:31].strip() or 'Sheet'  # excel sheet name ลองรับสูงสุด 31 ตัวอักษร
+    
+    # helper function for handle duplicate sheet name
+    def get_unique_sheet_name(base_name, existing_sheets):
+        sheet_name = clean_sheet_name(base_name)
+        base = sheet_name
+        counter = 1
+        while sheet_name in existing_sheets:
+            suffix = f'_{counter}'
+            sheet_name = base[:31 - len(suffix)] + suffix
+            counter += 1
+        return sheet_name
+    
+    # write excel
+    with pd.ExcelWriter(out_file, engine='openpyxl') as writer:
+        # num class base
+        if 'dataset_name' in df_master.columns:
+            df_master['num_class_group'] = df_master['dataset_name'].astype(str).str.extract(r'(\d+)\s*class', flags=re.IGNORECASE)[0]
+        
+            for num_cls, group_df in df_master.groupby('num_class_group'):
+                if pd.isna(num_cls):
+                    continue
+                sheet_name = get_unique_sheet_name(f"{num_cls}class", writer.sheets)
+                group_df.drop(columns=['num_class_group'], errors='ignore').to_excel(writer, sheet_name=sheet_name, index=False)
+                
+            df_master = df_master.drop(columns=['num_class_group'], errors='ignore')
+            
+        # individual dataset base
+        for ds_name, group_df in df_master.groupby('dataset_name'):
+            sheet_name = clean_sheet_name(ds_name)
+            
+            # handle duplicate name
+            base_name = sheet_name
+            counter = 1
+            while sheet_name in writer.sheets:
+                suffix = f'_{counter}'
+                sheet_name = base_name[:31 - len(suffix)] + suffix
+                counter += 1
+            
+            group_df.drop(columns=['dataset_name'], errors='ignore').to_excel(writer, sheet_name=sheet_name, index=False)
+            
+        # model base
+        for model_name, group_df in df_master.groupby('model'):
+            sheet_name = clean_sheet_name(model_name)
+            
+            # handle duplicate name
+            base_name = sheet_name
+            counter = 1
+            while sheet_name in writer.sheets:
+                suffix = f'_{counter}'
+                sheet_name = base_name[:31 - len(suffix)] + suffix
+                counter += 1
+            
+            group_df.drop(columns=['model'], errors='ignore').to_excel(writer, sheet_name=sheet_name, index=False)
+            
+    print(f'\nSuccessfully saved Excel file to: {out_file}')
 
 
 def main():
-    parser = argparse.ArgumentParser(description='รวม summary.csv ทั้งหมดเป็น Excel workbook เดียว')
-    parser.add_argument('--experiment', '-e', type=str, default=c.EXPERIMENT_NAME)
-    parser.add_argument('--output', '-o', type=str, default=None,
-                         help='path ไฟล์ .xlsx ปลายทาง (default: <output_dir>/<experiment>/all_results.xlsx)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-e', '--experiment', type=str, default=getattr(c, 'EXPERIMENT_NAME', None), help='Name of train experiment.')
+    parser.add_argument('-d', '--dir', type=str, default=getattr(c, 'OUTPUT_DIR', None), help='Path to root directory that store experiment results.')
     args = parser.parse_args()
-
-    experiment_dir = Path(c.OUTPUT_DIR) / args.experiment
-    out_path = Path(args.output) if args.output else experiment_dir / 'all_results.xlsx'
-
-    all_runs = collect_all_runs(experiment_dir)
-    if all_runs.empty:
-        print(f"❌ ไม่เจอ summary.csv เลยใต้ {experiment_dir / 'log'}")
+    
+    root = Path(args.dir)
+    experiment_name = args.experiment
+        
+    if not experiment_name:
+        print('[Error] Experiment name is missing. Please provide it via argument or in config file.')
         return
-
-    per_family = split_by(all_runs, key='family', sort_by=['dataset', 'variant'])
-    per_dataset = split_by(all_runs, key='dataset', sort_by=['family', 'variant'])
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
-        # sheet ต่อ family ก่อน (เทียบข้าม dataset)
-        for family_name, df in per_family.items():
-            sheet_name = family_name[:31]
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-        # ตามด้วย sheet ต่อ dataset (เทียบข้าม family) เหมือนเดิม
-        for dataset_name, df in per_dataset.items():
-            sheet_name = dataset_name[:31]
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-    print(f"✅ เขียน {len(all_runs)} แถว รวม -> {len(per_family)} family sheet, "
-          f"{len(per_dataset)} dataset sheet ไปที่ {out_path}")
-
-
+    
+    combine_results(root / experiment_name)
+    
+    
 if __name__ == '__main__':
     main()
